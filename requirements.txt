@@ -1,0 +1,2 @@
+uiautomation>=2.0.20
+PyYAML>=6.0

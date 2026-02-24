@@ -1,0 +1,77 @@
+# DingTalk Group File Collector — Configuration
+# Edit this file to match your environment. No Python edits should be needed.
+
+# ── DingTalk settings ──
+dingtalk:
+  # Window class name used to find the DingTalk main window
+  window_class: "StandardFrame_DingTalk"
+  # Where DingTalk saves downloaded files (check DingTalk settings)
+  download_dir: "C:\\Users\\YourUser\\Documents\\DingDing\\download"
+  # Seconds to wait for UI controls to appear
+  timeout: 10
+  # Seconds to wait after clicking download before checking for the file
+  download_wait: 5
+
+# ── Groups to collect files from ──
+# name  : exact display name in DingTalk (used for search)
+# alias : folder name on Google Drive (optional, defaults to name)
+groups:
+  - name: "示例群组1"
+    alias: "ExampleGroup1"
+  - name: "示例群组2"
+    alias: "ExampleGroup2"
+
+# ── Google Drive settings ──
+gdrive:
+  # Root folder where files will be organized as {alias}/{YYYY-MM}/{filename}
+  base_path: "G:\\My Drive\\DingTalk Files"
+
+# ── Polling ──
+polling:
+  interval_minutes: 30
+  # Max files to download per group per cycle (safety cap)
+  max_downloads_per_group: 50
+
+# ── Dedup tracker ──
+dedup:
+  path: "data/downloaded.json"
+
+# ── Logging ──
+logging:
+  dir: "logs"
+  level: "INFO"
+  max_bytes: 10485760      # 10 MB
+  backup_count: 5
+
+# ── UI Selectors ──
+# These map to uiautomation control properties.
+# Update when DingTalk changes its UI. Use tools/inspect_dingtalk.py to find values.
+ui_selectors:
+  search_box:
+    control_type: "EditControl"
+    name: "搜索"
+  search_result_item:
+    control_type: "ListItemControl"
+  files_tab:
+    control_type: "ButtonControl"
+    name: "文件"
+    # Fallback if ButtonControl doesn't match
+    fallback_control_type: "TabItemControl"
+  file_list:
+    control_type: "ListControl"
+    name: "文件列表"
+  file_item:
+    control_type: "ListItemControl"
+  download_button:
+    control_type: "ButtonControl"
+    name: "下载"
+  context_menu_download:
+    control_type: "MenuItemControl"
+    name: "下载"
+  # Dismiss-dialog button texts (checked in order)
+  dismiss_buttons:
+    - "稍后"
+    - "取消"
+    - "我知道了"
+    - "关闭"
+    - "忽略此版本"
