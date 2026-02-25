@@ -8,7 +8,6 @@ they are web-rendered inside DingTalk's CefBrowserWindow.
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import re
 from typing import Optional, Tuple
@@ -45,11 +44,42 @@ def grab_screenshot_base64(
         return base64.b64encode(png_bytes).decode("ascii")
 
 
+def _validate_coords(
+    x: int,
+    y: int,
+    image_size: Optional[Tuple[int, int]],
+    label: str,
+) -> bool:
+    """Check if coordinates fall within image bounds.
+
+    Args:
+        x, y: Coordinates to validate (relative to image, before offset).
+        image_size: (width, height) of the screenshot image.
+        label: Description for log messages.
+
+    Returns:
+        True if coordinates are valid (within bounds or no size given).
+    """
+    if image_size is None:
+        return True
+
+    w, h = image_size
+    if x < 0 or x >= w or y < 0 or y >= h:
+        log.warning(
+            "VLM returned out-of-bounds coordinates (%d, %d) for %s "
+            "(image size: %dx%d). Rejecting.",
+            x, y, label, w, h,
+        )
+        return False
+    return True
+
+
 def find_menu_item_coords(
     api_key: str,
     screenshot_b64: str,
     target_label: str = "Download",
     region_offset: Optional[Tuple[int, int]] = None,
+    image_size: Optional[Tuple[int, int]] = None,
     model: str = "qwen/qwen-vl-plus",
     base_url: str = "https://openrouter.ai/api/v1",
 ) -> Optional[Tuple[int, int]]:
@@ -61,6 +91,7 @@ def find_menu_item_coords(
         target_label: The menu item text to find (e.g. "Download" or "下载").
         region_offset: (left, top) offset to add to the returned coordinates
                        so they map back to screen-absolute pixels.
+        image_size: (width, height) of the screenshot for bounds checking.
         model: OpenRouter model identifier.
         base_url: OpenRouter API base URL.
 
@@ -71,8 +102,14 @@ def find_menu_item_coords(
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
+    # Include image dimensions in the prompt so the VLM knows the coordinate space
+    size_hint = ""
+    if image_size:
+        size_hint = f"The image is {image_size[0]}x{image_size[1]} pixels. "
+
     prompt = (
         f"Look at this screenshot of a right-click context menu. "
+        f"{size_hint}"
         f"Find the menu item labeled \"{target_label}\" (or \"下载\" in Chinese). "
         f"Return ONLY the pixel coordinates of the center of that menu item "
         f"in the format: x,y\n"
@@ -116,6 +153,10 @@ def find_menu_item_coords(
 
         x, y = int(m.group(1)), int(m.group(2))
 
+        # Bounds check before applying offset
+        if not _validate_coords(x, y, image_size, target_label):
+            return None
+
         # Add region offset so coords map to absolute screen position
         if region_offset:
             x += region_offset[0]
@@ -126,4 +167,112 @@ def find_menu_item_coords(
 
     except Exception as exc:
         log.error("VLM API call failed: %s", exc)
+        return None
+
+
+def find_icon_coords(
+    api_key: str,
+    screenshot_b64: str,
+    target_description: str = "download icon (a downward arrow ↓)",
+    region_offset: Optional[Tuple[int, int]] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+    model: str = "qwen/qwen-vl-plus",
+    base_url: str = "https://openrouter.ai/api/v1",
+) -> Optional[Tuple[int, int]]:
+    """Ask a VLM to locate an icon in a screenshot of a file row.
+
+    Used for hover-based download: when the mouse hovers over a file row,
+    action icons (download, share, etc.) appear on the right side.  This
+    function asks the VLM to find the download icon.
+
+    Args:
+        api_key: OpenRouter API key.
+        screenshot_b64: Base64-encoded PNG screenshot of the file row area.
+        target_description: Description of the icon to find.
+        region_offset: (left, top) offset to add to returned coordinates.
+        image_size: (width, height) of the screenshot for bounds checking.
+        model: OpenRouter model identifier.
+        base_url: OpenRouter API base URL.
+
+    Returns:
+        (x, y) screen coordinates of the icon center, or None if not found.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    # Include image dimensions in the prompt so the VLM knows the coordinate space
+    size_hint = ""
+    if image_size:
+        size_hint = (
+            f"The image is {image_size[0]}x{image_size[1]} pixels. "
+            f"Your coordinates must be within 0-{image_size[0]-1} for x "
+            f"and 0-{image_size[1]-1} for y. "
+        )
+
+    prompt = (
+        "Look at this screenshot of a file list row from DingTalk. "
+        f"{size_hint}"
+        "When the mouse hovers over a file row, action icons appear on the "
+        "right side of the row. "
+        f"Find the {target_description}. It is typically a small clickable "
+        "icon on the right portion of the row. Look for a downward-pointing "
+        "arrow icon (↓) which represents download. It may also be labeled "
+        "\"下载\" in Chinese.\n"
+        "Return ONLY the pixel coordinates of the center of that icon "
+        "in the format: x,y\n"
+        "For example: 850,25\n"
+        "If you cannot find any download icon or arrow, reply: NOT_FOUND"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{screenshot_b64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=50,
+            temperature=0,
+        )
+
+        reply = resp.choices[0].message.content.strip()
+        log.debug("VLM icon reply: %s", reply)
+
+        if "NOT_FOUND" in reply.upper():
+            log.warning("VLM could not find download icon in screenshot.")
+            return None
+
+        # Parse "x,y" from the reply (may contain extra text)
+        m = re.search(r"(\d+)\s*,\s*(\d+)", reply)
+        if not m:
+            log.warning("VLM icon reply not parseable as coordinates: %s", reply)
+            return None
+
+        x, y = int(m.group(1)), int(m.group(2))
+
+        # Bounds check before applying offset
+        if not _validate_coords(x, y, image_size, "download icon"):
+            return None
+
+        # Add region offset so coords map to absolute screen position
+        if region_offset:
+            x += region_offset[0]
+            y += region_offset[1]
+
+        log.info("VLM found download icon at (%d, %d).", x, y)
+        return (x, y)
+
+    except Exception as exc:
+        log.error("VLM icon API call failed: %s", exc)
         return None

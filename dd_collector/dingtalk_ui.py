@@ -437,7 +437,13 @@ class DingTalkController:
         return False
 
     def download_file(self, file_info: FileInfo) -> bool:
-        """Download a file.  Tries VLM-guided right-click first, then fallbacks.
+        """Download a file.  Tries multiple strategies in order.
+
+        Strategy order:
+        1. Hover + fixed offset click (fastest, no VLM call needed)
+        2. Hover + VLM icon detection (if offset click missed)
+        3. Right-click + VLM context menu (fallback)
+        4. Right-click + uiautomation MenuItemControl (legacy fallback)
 
         Returns True if the download was triggered.
         """
@@ -445,18 +451,193 @@ class DingTalkController:
         if not self._scroll_file_into_view(file_info):
             log.error("File not visible, cannot download: %s", file_info.name)
             return False
-        # Strategy 1 (primary): right-click → VLM finds "Download" in context menu
+
+        # Strategy 1 (primary): hover → click at fixed offset from right edge
+        if self._download_via_hover_offset(file_info):
+            return True
+
+        # Strategy 2: hover → VLM finds download icon → click
+        if self._download_via_vlm_hover(file_info):
+            return True
+
+        # Strategy 3: right-click → VLM finds "Download" in context menu
         if self._download_via_vlm(file_info):
             return True
 
-        # Strategy 2 (fallback): uiautomation right-click → MenuItemControl
+        # Strategy 4 (fallback): uiautomation right-click → MenuItemControl
         if self._download_via_context_menu(file_info):
             return True
 
         log.error("Failed to download file: %s", file_info.name)
         return False
 
-    # ── VLM-guided Download ───────────────────────────────────
+    # ── Hover + Fixed Offset Download (primary) ─────────────
+
+    def _download_via_hover_offset(self, file_info: FileInfo) -> bool:
+        """Hover over file row → click download icon at fixed offset from right edge.
+
+        DingTalk shows action icons (download, share, etc.) when hovering over
+        a file row.  The download icon is always at a predictable position
+        relative to the row's right edge.  This approach needs no VLM call.
+
+        The offset is configured via ``dingtalk.download_icon_offset`` in
+        config.yaml (pixels LEFT of the row's right edge, default 8).
+        The hover icons appear near the right edge of the row's
+        BoundingRectangle, with the download icon (↓) very close to it.
+        """
+        try:
+            rect = file_info.control.BoundingRectangle
+            if rect.width() <= 0 or rect.height() <= 0:
+                log.debug("File row has no valid BoundingRectangle for hover offset.")
+                return False
+
+            row_cx = (rect.left + rect.right) // 2
+            row_cy = (rect.top + rect.bottom) // 2
+
+            # Ensure DingTalk is focused
+            if self._window:
+                try:
+                    self._window.SetActive()
+                    self._window.SetFocus()
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+            # Step 1: Hover over the file row center to trigger icon appearance
+            log.debug(
+                "Hover-offset: moving to row center (%d, %d) for %s",
+                row_cx, row_cy, file_info.name,
+            )
+            pyautogui.moveTo(row_cx, row_cy)
+            time.sleep(1.0)  # wait for hover action icons to render
+
+            # Step 2: Click at fixed offset to the LEFT of the row's right edge.
+            # The download icon (↓) sits near the right edge of the row's
+            # BoundingRectangle, typically ~8 px to the left of rect.right.
+            offset = self.dt.download_icon_offset
+            click_x = rect.right - offset
+            click_y = row_cy
+            log.info(
+                "Hover-offset: clicking download icon at (%d, %d) "
+                "(right_edge=%d - offset=%d) for %s",
+                click_x, click_y, rect.right, offset, file_info.name,
+            )
+            pyautogui.click(click_x, click_y)
+
+            # Handle potential save dialog
+            self._handle_save_dialog()
+            time.sleep(self.dt.download_wait)
+            log.info(
+                "Download triggered (hover offset): %s", file_info.name,
+            )
+            return True
+
+        except Exception as exc:
+            log.warning("_download_via_hover_offset failed: %s", exc)
+            return False
+
+    # ── VLM Hover-based Download ──────────────────────────────
+
+    def _download_via_vlm_hover(self, file_info: FileInfo) -> bool:
+        """Hover over file row → action icons appear → VLM locates download icon → click.
+
+        This avoids the context-menu-fading problem: the download icon is part
+        of the row itself and only appears on hover, so we keep the mouse on
+        the row while screenshotting.
+
+        Steps:
+        1. Move mouse to file row center (hover).
+        2. Wait for hover action icons to render (~1 s).
+        3. Screenshot the row area (with some right-side margin for icons).
+        4. Send screenshot to VLM → get (x, y) of download icon.
+        5. Click at those coordinates (icon is near the row, so mouse moves little).
+        """
+        from .vlm import find_icon_coords, grab_screenshot_base64
+
+        vlm_cfg = self.cfg.vlm
+        if not vlm_cfg.api_key:
+            log.debug("VLM API key not configured, skipping hover strategy.")
+            return False
+
+        try:
+            rect = file_info.control.BoundingRectangle
+            if rect.width() <= 0 or rect.height() <= 0:
+                log.debug("File row has no valid BoundingRectangle for hover.")
+                return False
+
+            row_cx = (rect.left + rect.right) // 2
+            row_cy = (rect.top + rect.bottom) // 2
+
+            # Ensure DingTalk is focused
+            if self._window:
+                try:
+                    self._window.SetActive()
+                    self._window.SetFocus()
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+            # Step 1: Hover over the file row center
+            log.debug(
+                "Hovering over file row at (%d, %d) for %s",
+                row_cx, row_cy, file_info.name,
+            )
+            pyautogui.moveTo(row_cx, row_cy)
+            time.sleep(1.5)  # wait for hover action icons to render
+
+            # Step 2: Screenshot the row area + generous right margin for icons
+            margin = vlm_cfg.capture_margin
+            # Capture the full row width plus extra right margin for hover icons
+            cap_left = max(0, rect.left - 20)
+            cap_top = max(0, rect.top - 10)
+            cap_right = rect.right + margin  # icons appear on the right
+            cap_bottom = rect.bottom + 10
+            region = (cap_left, cap_top, cap_right, cap_bottom)
+
+            screenshot_b64 = grab_screenshot_base64(region)
+            log.debug(
+                "Captured hover row screenshot (%dx%d) at (%d,%d).",
+                cap_right - cap_left, cap_bottom - cap_top, cap_left, cap_top,
+            )
+
+            # Step 3: Ask VLM to find the download icon
+            img_w = cap_right - cap_left
+            img_h = cap_bottom - cap_top
+            coords = find_icon_coords(
+                api_key=vlm_cfg.api_key,
+                screenshot_b64=screenshot_b64,
+                target_description="download icon (a downward arrow ↓)",
+                region_offset=(cap_left, cap_top),
+                image_size=(img_w, img_h),
+                model=vlm_cfg.model,
+                base_url=vlm_cfg.base_url,
+            )
+
+            if not coords:
+                log.warning("VLM could not locate download icon in hover row.")
+                return False
+
+            # Step 4: Click at the VLM-identified coordinates
+            click_x, click_y = coords
+            log.info(
+                "VLM hover: clicking download icon at (%d, %d) for %s",
+                click_x, click_y, file_info.name,
+            )
+            pyautogui.click(click_x, click_y)
+
+            # Handle potential save dialog
+            self._handle_save_dialog()
+            time.sleep(self.dt.download_wait)
+            log.info(
+                "Download triggered (VLM hover): %s", file_info.name,
+            )
+            return True
+
+        except Exception as exc:
+            log.warning("_download_via_vlm_hover failed: %s", exc)
+            return False
+
+    # ── VLM Right-Click Download (fallback) ───────────────────
 
     def _download_via_vlm(self, file_info: FileInfo) -> bool:
         """Right-click → screenshot context menu → VLM locates 'Download' → click.
@@ -510,11 +691,14 @@ class DingTalkController:
             )
 
             # Step 3: Ask VLM to find "Download"
+            img_w = cap_right - cap_left
+            img_h = cap_bottom - cap_top
             coords = find_menu_item_coords(
                 api_key=vlm_cfg.api_key,
                 screenshot_b64=screenshot_b64,
                 target_label="Download",
                 region_offset=(cap_left, cap_top),
+                image_size=(img_w, img_h),
                 model=vlm_cfg.model,
                 base_url=vlm_cfg.base_url,
             )

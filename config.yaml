@@ -12,9 +12,10 @@ dingtalk:
   timeout: 10
   # Seconds to wait after clicking download before checking for the file
   download_wait: 5
-  # Pixels from the right edge of a file row to the download icon center.
+  # Pixels LEFT of the row's right edge where the download icon center is.
+  # The hover icons appear near the right edge of the BoundingRectangle.
   # Adjust if DingTalk changes its hover-icon layout.
-  download_icon_offset: 95
+  download_icon_offset: 8
 
 # ── Groups to collect files from ──
 # name  : exact display name in DingTalk (used for search)
@@ -50,7 +51,7 @@ logging:
 # ── VLM (Vision Language Model for UI element detection) ──
 vlm:
   # OpenRouter API key (can also be set via OPENROUTER_API_KEY env var)
-  api_key: "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"
+  api_key: "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"
   model: "qwen/qwen-vl-plus"
   base_url: "https://openrouter.ai/api/v1"
   # Pixels around the right-click point to capture for context menu screenshot

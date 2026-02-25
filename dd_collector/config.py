@@ -18,7 +18,7 @@ class DingTalkConfig:
     download_dir: str = ""
     timeout: int = 10
     download_wait: int = 5
-    download_icon_offset: int = 95
+    download_icon_offset: int = 8
 
 
 @dataclass
