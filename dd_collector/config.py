@@ -18,6 +18,7 @@ class DingTalkConfig:
     download_dir: str = ""
     timeout: int = 10
     download_wait: int = 5
+    download_icon_offset: int = 95
 
 
 @dataclass
@@ -128,6 +129,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         download_dir=dt.get("download_dir", cfg.dingtalk.download_dir),
         timeout=int(dt.get("timeout", cfg.dingtalk.timeout)),
         download_wait=int(dt.get("download_wait", cfg.dingtalk.download_wait)),
+        download_icon_offset=int(dt.get("download_icon_offset", cfg.dingtalk.download_icon_offset)),
     )
 
     # Groups

@@ -6,11 +6,14 @@ dingtalk:
   # Window class name used to find the DingTalk main window
   window_class: "StandardFrame_DingTalk"
   # Where DingTalk saves downloaded files (check DingTalk settings)
-  download_dir: "C:\\Users\\YOUR_USERNAME\\Documents\\DingDing\\download"
+  download_dir: "C:\\Users\\vm\\Documents\\DingDing\\download"
   # Seconds to wait for UI controls to appear
   timeout: 10
   # Seconds to wait after clicking download before checking for the file
   download_wait: 5
+  # Pixels from the right edge of a file row to the download icon center.
+  # Adjust if DingTalk changes its hover-icon layout.
+  download_icon_offset: 95
 
 # ── Groups to collect files from ──
 # name  : exact display name in DingTalk (used for search)
@@ -73,10 +76,8 @@ ui_selectors:
     - "Later"
     - "Cancel"
     - "OK"
-    - "Close"
     - "Ignore this version"
     - "稍后"
     - "取消"
     - "我知道了"
-    - "关闭"
     - "忽略此版本"
