@@ -127,6 +127,30 @@ def scroll_to_bottom(control: auto.Control, max_scrolls: int = 50) -> None:
         log.debug("scroll_to_bottom fallback failed: %s", exc)
 
 
+def scroll_to_top(control: auto.Control, max_scrolls: int = 50) -> None:
+    """Scroll a control to the top using ScrollPattern, with Home key fallback."""
+    try:
+        sp = control.GetScrollPattern()
+        if sp:
+            for _ in range(max_scrolls):
+                vert = sp.VerticalScrollPercent
+                if vert <= 0:
+                    break
+                sp.Scroll(auto.ScrollAmount.NoAmount, auto.ScrollAmount.LargeDecrement)
+                time.sleep(0.2)
+            return
+    except Exception:
+        pass
+
+    # Fallback: send Home key
+    try:
+        control.SetFocus()
+        control.SendKeys("{Home}")
+        time.sleep(0.3)
+    except Exception as exc:
+        log.debug("scroll_to_top fallback failed: %s", exc)
+
+
 def send_escape() -> None:
     """Press Escape key to dismiss dialogs or cancel searches."""
     try:

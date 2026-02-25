@@ -47,6 +47,15 @@ logging:
   max_bytes: 10485760      # 10 MB
   backup_count: 5
 
+# ── VLM (Vision Language Model for UI element detection) ──
+vlm:
+  # OpenRouter API key (can also be set via OPENROUTER_API_KEY env var)
+  api_key: "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"
+  model: "qwen/qwen-vl-plus"
+  base_url: "https://openrouter.ai/api/v1"
+  # Pixels around the right-click point to capture for context menu screenshot
+  capture_margin: 300
+
 # ── UI Selectors ──
 # These map to uiautomation control properties.
 # Update when DingTalk changes its UI. Use tools/inspect_dingtalk.py to find values.

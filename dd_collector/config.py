@@ -77,6 +77,16 @@ class UISelectorsConfig:
 
 
 @dataclass
+class VLMConfig:
+    """Vision Language Model settings for UI element detection."""
+    api_key: str = ""
+    model: str = "qwen/qwen-vl-plus"
+    base_url: str = "https://openrouter.ai/api/v1"
+    # Pixels around the right-click point to capture for context menu detection
+    capture_margin: int = 300
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     groups: List[GroupConfig] = field(default_factory=list)
@@ -85,6 +95,7 @@ class AppConfig:
     dedup: DedupConfig = field(default_factory=DedupConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ui_selectors: UISelectorsConfig = field(default_factory=UISelectorsConfig)
+    vlm: VLMConfig = field(default_factory=VLMConfig)
 
 
 # ── Loader ───────────────────────────────────────────────────
@@ -167,5 +178,14 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
     # UI Selectors
     cfg.ui_selectors = _build_ui_selectors(raw.get("ui_selectors", {}))
+
+    # VLM
+    v = raw.get("vlm", {})
+    cfg.vlm = VLMConfig(
+        api_key=v.get("api_key", os.environ.get("OPENROUTER_API_KEY", "")),
+        model=v.get("model", cfg.vlm.model),
+        base_url=v.get("base_url", cfg.vlm.base_url),
+        capture_margin=int(v.get("capture_margin", cfg.vlm.capture_margin)),
+    )
 
     return cfg

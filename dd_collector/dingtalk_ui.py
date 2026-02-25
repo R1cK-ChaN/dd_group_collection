@@ -20,6 +20,7 @@ from .ui_helpers import (
     safe_click,
     safe_right_click,
     scroll_to_bottom,
+    scroll_to_top,
     send_escape,
     set_text,
 )
@@ -379,32 +380,159 @@ class DingTalkController:
             files.append(FileInfo(name=fname, control=ctrl, timestamp=ts))
 
         log.info("Found %d files in list.", len(files))
+
+        # Scroll back to top so newest files are visible for interaction
+        scroll_to_top(grid, max_scrolls=max_scrolls + 5)
+        time.sleep(0.3)
+
         return files
 
     # ── Download ─────────────────────────────────────────────
 
+    def _scroll_file_into_view(self, file_info: FileInfo) -> bool:
+        """Ensure the file row is visible on screen before interacting with it.
+
+        Returns True if the BoundingRectangle is valid (non-zero).
+        """
+        rect = file_info.control.BoundingRectangle
+        if rect.width() > 0 and rect.height() > 0:
+            return True
+
+        # Try ScrollItemPattern to bring the control into view
+        try:
+            sip = file_info.control.GetScrollItemPattern()
+            if sip:
+                sip.ScrollIntoView()
+                time.sleep(0.5)
+                rect = file_info.control.BoundingRectangle
+                if rect.width() > 0 and rect.height() > 0:
+                    return True
+        except Exception:
+            pass
+
+        log.warning(
+            "Cannot scroll file into view: %s (rect still zero)", file_info.name,
+        )
+        return False
+
     def download_file(self, file_info: FileInfo) -> bool:
-        """Download a file. Tries pyautogui hover first, then legacy strategies.
+        """Download a file.  Tries VLM-guided right-click first, then fallbacks.
 
         Returns True if the download was triggered.
         """
-        # Strategy 1 (primary): pyautogui real mouse hover + click
-        if self._download_via_hover_pyautogui(file_info):
+        # Ensure the file row is visible on screen
+        if not self._scroll_file_into_view(file_info):
+            log.error("File not visible, cannot download: %s", file_info.name)
+            return False
+        # Strategy 1 (primary): right-click → VLM finds "Download" in context menu
+        if self._download_via_vlm(file_info):
             return True
 
-        # Strategy 2 (fallback): Right-click → context menu "下载"
+        # Strategy 2 (fallback): uiautomation right-click → MenuItemControl
         if self._download_via_context_menu(file_info):
-            return True
-
-        # Strategy 3 (fallback): uiautomation hover → click download button
-        if self._download_via_hover_button(file_info):
             return True
 
         log.error("Failed to download file: %s", file_info.name)
         return False
 
+    # ── VLM-guided Download ───────────────────────────────────
+
+    def _download_via_vlm(self, file_info: FileInfo) -> bool:
+        """Right-click → screenshot context menu → VLM locates 'Download' → click.
+
+        1. Right-click the file row center with pyautogui (real mouse event).
+        2. Capture a screenshot of the region around the click.
+        3. Send to Qwen-VL-Plus via OpenRouter to get the (x, y) of "Download".
+        4. Click at those coordinates.
+        """
+        from .vlm import find_menu_item_coords, grab_screenshot_base64
+
+        vlm_cfg = self.cfg.vlm
+        if not vlm_cfg.api_key:
+            log.debug("VLM API key not configured, skipping VLM strategy.")
+            return False
+
+        try:
+            rect = file_info.control.BoundingRectangle
+            if rect.width() <= 0 or rect.height() <= 0:
+                log.debug("File row has no valid BoundingRectangle.")
+                return False
+
+            row_cx = (rect.left + rect.right) // 2
+            row_cy = (rect.top + rect.bottom) // 2
+
+            # Ensure DingTalk is focused
+            if self._window:
+                try:
+                    self._window.SetActive()
+                    self._window.SetFocus()
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+            # Step 1: Right-click with real mouse
+            pyautogui.rightClick(row_cx, row_cy)
+            time.sleep(1.0)  # wait for context menu to render
+
+            # Step 2: Capture region around the right-click point
+            margin = vlm_cfg.capture_margin
+            cap_left = max(0, row_cx - margin)
+            cap_top = max(0, row_cy - margin)
+            cap_right = row_cx + margin
+            cap_bottom = row_cy + margin
+            region = (cap_left, cap_top, cap_right, cap_bottom)
+
+            screenshot_b64 = grab_screenshot_base64(region)
+            log.debug(
+                "Captured context menu screenshot (%dx%d) at (%d,%d).",
+                cap_right - cap_left, cap_bottom - cap_top, cap_left, cap_top,
+            )
+
+            # Step 3: Ask VLM to find "Download"
+            coords = find_menu_item_coords(
+                api_key=vlm_cfg.api_key,
+                screenshot_b64=screenshot_b64,
+                target_label="Download",
+                region_offset=(cap_left, cap_top),
+                model=vlm_cfg.model,
+                base_url=vlm_cfg.base_url,
+            )
+
+            if not coords:
+                log.warning("VLM could not locate Download in context menu.")
+                pyautogui.press("escape")
+                time.sleep(0.3)
+                return False
+
+            # Step 4: Click at the VLM-identified coordinates
+            click_x, click_y = coords
+            log.info(
+                "VLM: clicking Download at (%d, %d) for %s",
+                click_x, click_y, file_info.name,
+            )
+            pyautogui.click(click_x, click_y)
+
+            # Handle potential save dialog
+            self._handle_save_dialog()
+            time.sleep(self.dt.download_wait)
+            log.info(
+                "Download triggered (VLM context menu): %s", file_info.name,
+            )
+            return True
+
+        except Exception as exc:
+            log.warning("_download_via_vlm failed: %s", exc)
+            # Dismiss any lingering context menu
+            try:
+                pyautogui.press("escape")
+            except Exception:
+                pass
+            return False
+
+    # ── Legacy Download Fallbacks ─────────────────────────────
+
     def _download_via_context_menu(self, file_info: FileInfo) -> bool:
-        """Right-click the file item, then click '下载' in the context menu."""
+        """Right-click → find MenuItemControl via uiautomation (legacy fallback)."""
         if not safe_right_click(file_info.control, delay_after=0.5):
             return False
 
@@ -423,94 +551,9 @@ class DingTalkController:
             send_escape()
             return False
 
-        log.info("Download triggered (context menu): %s", file_info.name)
+        log.info("Download triggered (context menu uia): %s", file_info.name)
         time.sleep(self.dt.download_wait)
         return True
-
-    def _download_via_hover_button(self, file_info: FileInfo) -> bool:
-        """Hover over the file item to reveal the download button, then click it."""
-        try:
-            file_info.control.MoveCursorToMyCenter()
-            time.sleep(0.5)
-        except Exception as exc:
-            log.debug("Hover failed: %s", exc)
-            return False
-
-        sel = self.sel.download_button
-        dl_btn = find_control(
-            file_info.control,
-            sel.control_type,
-            timeout=3,
-            Name=sel.name,
-        )
-        if not dl_btn:
-            # Try searching from window root as the button might be a popup
-            dl_btn = find_control(
-                self._window,
-                sel.control_type,
-                timeout=2,
-                Name=sel.name,
-            )
-        if not dl_btn:
-            return False
-
-        if not safe_click(dl_btn, delay_after=0.5):
-            return False
-
-        log.info("Download triggered (hover button): %s", file_info.name)
-        time.sleep(self.dt.download_wait)
-        return True
-
-    # ── pyautogui Download ────────────────────────────────────
-
-    def _download_via_hover_pyautogui(self, file_info: FileInfo) -> bool:
-        """Hover over the file row with a real mouse move (pyautogui) to trigger
-        the web-rendered download icon, then click it.
-
-        The CefBrowserWindow hover icons are invisible to Windows UI Automation
-        but respond to real mouse events generated by pyautogui.
-        """
-        try:
-            rect = file_info.control.BoundingRectangle
-            if rect.width() <= 0 or rect.height() <= 0:
-                log.debug("File row has no valid BoundingRectangle.")
-                return False
-
-            row_cx = (rect.left + rect.right) // 2
-            row_cy = (rect.top + rect.bottom) // 2
-
-            # Step 1: Move real mouse to row center to trigger hover state
-            pyautogui.moveTo(row_cx, row_cy, duration=0.2)
-            time.sleep(0.8)
-
-            # Step 2: Check if hover revealed any accessible download button
-            for child in file_info.control.GetChildren():
-                name = (child.Name or "").lower()
-                if name in ("download", "下载"):
-                    log.debug("Found accessible download button after hover.")
-                    safe_click(child)
-                    self._handle_save_dialog()
-                    time.sleep(self.dt.download_wait)
-                    log.info("Download triggered (pyautogui hover, accessible button): %s", file_info.name)
-                    return True
-
-            # Step 3: Click at estimated download icon position (right side of row)
-            offset = self.dt.download_icon_offset
-            click_x = int(rect.right) - offset
-            click_y = row_cy
-            log.debug(
-                "Clicking estimated download icon at (%d, %d) for %s",
-                click_x, click_y, file_info.name,
-            )
-            pyautogui.click(click_x, click_y)
-            self._handle_save_dialog()
-            time.sleep(self.dt.download_wait)
-            log.info("Download triggered (pyautogui hover): %s", file_info.name)
-            return True
-
-        except Exception as exc:
-            log.warning("_download_via_hover_pyautogui failed: %s", exc)
-            return False
 
     def _handle_save_dialog(self) -> None:
         """Check for and dismiss any save/download confirmation dialog."""
