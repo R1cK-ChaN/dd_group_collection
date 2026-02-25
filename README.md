@@ -17,43 +17,50 @@ Uses RPA-style UI automation (`uiautomation`) to drive the DingTalk PC client �
 | Connect to DingTalk | Working | Window class `StandardFrame_DingTalk` found |
 | Navigate to group | Working | Search box (`EditControl Name='Search'`) works; `set_text` falls back to `SendKeys` |
 | Open Files tab | Working | `ButtonControl Name='File'` clicks successfully |
-| List files | Partially working | See **Known Issues #1** below |
-| Download files | Working | Uses `pyautogui` hover + click (see **Known Issues #2**) |
+| List files | **Blocked** | CefBrowserWindow accessibility tree not exposed; see **Known Issues #1** |
+| Download files | **Blocked** | Depends on list_files; pyautogui hover approach ready but untested |
 | Move to GDrive | Not yet tested | Depends on download working |
 
 ## Known Issues & Challenges
 
-### 1. File list is inside a CefBrowserWindow (web view)
+### 1. CefBrowserWindow accessibility tree not exposed (primary blocker)
 
-The Files tab renders its content in a Chromium Embedded Framework web view, not native Windows controls.
+The Files tab renders inside a Chromium Embedded Framework web view (`CefBrowserWindow`). The file grid (`DocumentControl` → `GroupControl Name='grid'` → `CustomControl` rows) was visible in an earlier session but is **no longer accessible** — the CefBrowserWindow now returns only an empty `CustomControl` with no children.
 
-**Original assumption:** File list uses native `ListControl` / `ListItemControl`.
-**Reality:** The actual file entries are:
+**What was tried:**
+- Sending `WM_GETOBJECT` to `Chrome_WidgetWin_1` — returned non-zero but tree stayed empty
+- Starting Windows Narrator to trigger Chromium accessibility — no effect
+- Searching with `searchDepth=15` — no deeper controls found
+- Checking for Chrome DevTools Protocol (CDP) ports — none open
 
+**Current CefBrowserWindow tree (empty):**
 ```
-DocumentControl (ClassName='Chrome_RenderWidgetHostHWND', Name='群文件-Online')
- └─ GroupControl (AutoId='root')
-     └─ ... → TableControl
-              └─ GroupControl (Name='grid')
-                  └─ GroupControl (container)
-                      ├─ CustomControl (Name=' filename.pdf 125.1 KB  ·2026/02/21 10:50Author')
-                      ├─ CustomControl (Name=' filename2.pdf ...')
-                      └─ ...
+PaneControl (Class='CefBrowserWindow')
+ └─ PaneControl (Class='Chrome_WidgetWin_1')
+     └─ PaneControl
+         └─ CustomControl (empty — no Name, no children)
 ```
 
-The original `list_files()` was matching the **chat sidebar** (`ListItemControl` from the conversation list) instead of actual files. A fix has been applied to `dingtalk_ui.py` to navigate into the web view and read `CustomControl` items from the `grid` `GroupControl`. File names are parsed from the `Name` property using regex.
+**Native controls that ARE visible** (proving the files tab is open):
+- `ButtonControl Name='Upload File'` at (594,626)
+- `ButtonControl Name='Files'` at (1164,50)
 
-### 2. Download mechanism — fixed with pyautogui hover
+**Possible solutions to investigate:**
+1. Launch DingTalk with `--force-renderer-accessibility` flag
+2. Set Chromium accessibility via registry (`HKCU\Software\Chromium\Accessibility`)
+3. Use screenshot + VLM/OCR to identify file rows visually and click by coordinates
+4. Inject CDP access by modifying DingTalk's CEF launch flags
+5. Use keyboard navigation (Tab/Arrow) to select files within the web view
 
-The file list's hover-revealed download icons are web-rendered inside the CefBrowserWindow and invisible to Windows UI Automation. The original context menu and hover button strategies both failed.
+### 2. Download mechanism — pyautogui hover approach implemented but blocked by #1
 
-**Fix:** `_download_via_hover_pyautogui()` uses `pyautogui` to generate real mouse events:
-1. Gets the file row's `BoundingRectangle` (visible to uiautomation)
+`_download_via_hover_pyautogui()` was added to use `pyautogui` real mouse events:
+1. Gets the file row's `BoundingRectangle` (requires accessibility tree from #1)
 2. Moves the real mouse cursor to the row center (triggers Chromium hover state)
 3. Checks for any newly accessible download button children
 4. If none found, clicks at `(row_right - offset, row_center_y)` where the download icon appears
 
-The offset is configurable via `dingtalk.download_icon_offset` in `config.yaml` (default: 95px). If DingTalk changes its hover icon layout, adjust this value. The legacy context menu and hover button strategies are kept as fallbacks.
+The offset is configurable via `dingtalk.download_icon_offset` in `config.yaml` (default: 95px). Cannot be tested until the file listing (Issue #1) is resolved.
 
 ### 3. Dialog dismissal was closing DingTalk
 
