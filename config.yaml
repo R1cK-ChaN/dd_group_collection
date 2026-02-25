@@ -6,7 +6,7 @@ dingtalk:
   # Window class name used to find the DingTalk main window
   window_class: "StandardFrame_DingTalk"
   # Where DingTalk saves downloaded files (check DingTalk settings)
-  download_dir: "C:\\Users\\vm\\Documents\\DingDing\\download"
+  download_dir: "C:\\Users\\YOUR_USERNAME\\Documents\\DingDing\\download"
   # Seconds to wait for UI controls to appear
   timeout: 10
   # Seconds to wait after clicking download before checking for the file
@@ -16,10 +16,10 @@ dingtalk:
 # name  : exact display name in DingTalk (used for search)
 # alias : folder name on Google Drive (optional, defaults to name)
 groups:
-  - name: "示例群组1"
-    alias: "ExampleGroup1"
-  - name: "示例群组2"
-    alias: "ExampleGroup2"
+  - name: "Degg"
+    alias: "Degg"
+  - name: "资料分享群"
+    alias: "资料分享群"
 
 # ── Google Drive settings ──
 gdrive:
@@ -49,27 +49,32 @@ logging:
 ui_selectors:
   search_box:
     control_type: "EditControl"
-    name: "搜索"
+    name: "Search"
   search_result_item:
     control_type: "ListItemControl"
   files_tab:
     control_type: "ButtonControl"
-    name: "文件"
+    name: "File"
     # Fallback if ButtonControl doesn't match
     fallback_control_type: "TabItemControl"
   file_list:
     control_type: "ListControl"
-    name: "文件列表"
+    name: ""
   file_item:
     control_type: "ListItemControl"
   download_button:
     control_type: "ButtonControl"
-    name: "下载"
+    name: "Download"
   context_menu_download:
     control_type: "MenuItemControl"
-    name: "下载"
+    name: "Download"
   # Dismiss-dialog button texts (checked in order)
   dismiss_buttons:
+    - "Later"
+    - "Cancel"
+    - "OK"
+    - "Close"
+    - "Ignore this version"
     - "稍后"
     - "取消"
     - "我知道了"

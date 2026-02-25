@@ -292,18 +292,27 @@ class DingTalkController:
 
     # ── Dialog Dismissal ─────────────────────────────────────
 
-    def dismiss_dialogs(self) -> None:
-        """Dismiss update/notification popups by looking for known button texts."""
+    def dismiss_dialogs(self, max_rounds: int = 3) -> None:
+        """Dismiss update/notification popups by looking for known button texts.
+
+        Repeats up to *max_rounds* times so stacked dialogs are handled,
+        but cannot loop forever if a button keeps reappearing.
+        """
         if not self._window:
             return
 
-        for btn_text in self.sel.dismiss_buttons:
-            btn = find_control(
-                self._window,
-                "ButtonControl",
-                timeout=1,
-                Name=btn_text,
-            )
-            if btn:
-                log.info("Dismissing dialog with button: %s", btn_text)
-                safe_click(btn, delay_after=0.3)
+        for _round in range(max_rounds):
+            dismissed = False
+            for btn_text in self.sel.dismiss_buttons:
+                btn = find_control(
+                    self._window,
+                    "ButtonControl",
+                    timeout=1,
+                    Name=btn_text,
+                )
+                if btn:
+                    log.info("Dismissing dialog with button: %s", btn_text)
+                    safe_click(btn, delay_after=0.3)
+                    dismissed = True
+            if not dismissed:
+                break
