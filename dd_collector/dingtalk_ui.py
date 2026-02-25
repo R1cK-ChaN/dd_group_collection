@@ -316,13 +316,34 @@ class DingTalkController:
     def _parse_timestamp(raw_name: str) -> Optional[str]:
         """Extract the upload timestamp from a file row Name.
 
-        Raw format: '  filename.pdf 1.1 MB  ·2025/07/02 13:52AuthorName'
-        Returns: '2025/07/02 13:52' or None.
+        DingTalk uses relative date labels for recent files:
+        - Today:     '·Today 18:51AuthorName'
+        - Yesterday: '·Yesterday 14:30AuthorName'
+        - Older:     '·2025/07/02 13:52AuthorName'
+
+        All are normalised to 'YYYY/MM/DD HH:MM' for consistent comparison.
+        Returns None if no timestamp can be parsed.
         """
         import re
+        from datetime import datetime, timedelta
+
+        # Pattern 1: absolute date  ·YYYY/MM/DD HH:MM
         m = re.search(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", raw_name)
         if m:
             return m.group(1)
+
+        # Pattern 2: ·Today HH:MM
+        m = re.search(r"·Today\s+(\d{2}:\d{2})", raw_name)
+        if m:
+            today = datetime.now().strftime("%Y/%m/%d")
+            return f"{today} {m.group(1)}"
+
+        # Pattern 3: ·Yesterday HH:MM
+        m = re.search(r"·Yesterday\s+(\d{2}:\d{2})", raw_name)
+        if m:
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y/%m/%d")
+            return f"{yesterday} {m.group(1)}"
+
         return None
 
     def list_files(self, max_scrolls: int = 30) -> List[FileInfo]:
