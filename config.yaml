@@ -6,7 +6,7 @@ dingtalk:
   # Window class name used to find the DingTalk main window
   window_class: "StandardFrame_DingTalk"
   # Where DingTalk saves downloaded files (check DingTalk settings)
-  download_dir: "C:\\Users\\rick\\Documents\\DingDing\\download"
+  download_dir: "C:\\Users\\vm\\Documents\\DingDing\\download"
   # Seconds to wait for UI controls to appear
   timeout: 10
   # Seconds to wait after clicking download before checking for the file
