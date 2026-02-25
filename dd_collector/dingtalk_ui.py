@@ -32,6 +32,7 @@ class FileInfo:
     """Represents one file entry in a DingTalk group's file list."""
     name: str
     control: auto.Control  # reference to the ListItem for clicking
+    timestamp: Optional[str] = None  # "YYYY/MM/DD HH:MM" from the raw Name
 
 
 class DingTalkController:
@@ -264,21 +265,35 @@ class DingTalkController:
     # ── File Listing ─────────────────────────────────────────
 
     def _find_file_grid(self) -> Optional[auto.Control]:
-        """Locate the 'grid' GroupControl inside the CefBrowserWindow file view."""
-        try:
-            doc = find_control(
-                self._window,
-                "DocumentControl",
-                timeout=self.dt.timeout,
-                ClassName="Chrome_RenderWidgetHostHWND",
-            )
-            if not doc:
-                log.debug("CefBrowser DocumentControl not found.")
-                return None
+        """Locate the 'grid' GroupControl inside the file view.
 
-            # Find the GroupControl named 'grid' which holds file rows
-            grid = find_control(doc, "GroupControl", timeout=self.dt.timeout, Name="grid")
-            return grid
+        The grid can appear in two layouts:
+        - Current: GroupControl Name='grid' directly accessible from the window
+        - Legacy: inside DocumentControl(Chrome_RenderWidgetHostHWND) → GroupControl Name='grid'
+        """
+        try:
+            # Try direct search first (current DtMainFrameView layout)
+            grid = find_control(
+                self._window, "GroupControl",
+                timeout=self.dt.timeout, Name="grid",
+            )
+            if grid:
+                return grid
+
+            # Legacy: inside DocumentControl
+            doc = find_control(
+                self._window, "DocumentControl",
+                timeout=3, ClassName="Chrome_RenderWidgetHostHWND",
+            )
+            if doc:
+                grid = find_control(
+                    doc, "GroupControl", timeout=3, Name="grid",
+                )
+                if grid:
+                    return grid
+
+            log.debug("File grid not found in any known layout.")
+            return None
         except Exception as exc:
             log.debug("_find_file_grid error: %s", exc)
             return None
@@ -286,7 +301,7 @@ class DingTalkController:
     @staticmethod
     def _parse_filename(raw_name: str) -> str:
         """Extract the filename from a CustomControl Name like:
-        '\\xa0 report.pdf 125.1 KB\\xa0\\xa0·2026/02/21 10:50Author'
+        '  250702GMF.PDF 1.1 MB  ·2025/07/02 13:52沧海一土狗'
         """
         import re
         cleaned = raw_name.replace("\xa0", " ").strip()
@@ -296,11 +311,31 @@ class DingTalkController:
             return m.group(1).strip()
         return cleaned
 
-    def list_files(self) -> List[FileInfo]:
+    @staticmethod
+    def _parse_timestamp(raw_name: str) -> Optional[str]:
+        """Extract the upload timestamp from a file row Name.
+
+        Raw format: '  filename.pdf 1.1 MB  ·2025/07/02 13:52AuthorName'
+        Returns: '2025/07/02 13:52' or None.
+        """
+        import re
+        m = re.search(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", raw_name)
+        if m:
+            return m.group(1)
+        return None
+
+    def list_files(self, max_scrolls: int = 30) -> List[FileInfo]:
         """Enumerate visible files in the files tab.
 
-        The file list lives inside a CefBrowserWindow as a TableControl
-        with CustomControl children inside a GroupControl named 'grid'.
+        The file grid has two possible structures:
+        - Current: grid → GroupControl(container) → CustomControl(file rows)
+        - Legacy:  grid → CustomControl(file rows) directly
+
+        Args:
+            max_scrolls: How many scroll-down iterations to perform to load
+                files.  Use a small value (e.g. 3) for incremental checks
+                where only the newest files at the top of the list matter.
+                Use a large value (e.g. 30) for a full scan.
 
         Returns a list of FileInfo with name and control reference.
         """
@@ -309,26 +344,30 @@ class DingTalkController:
 
         grid = self._find_file_grid()
         if not grid:
-            log.warning("File grid not found. Falling back to TableControl search.")
-            # Direct fallback: find TableControl in the window
-            table = find_control(self._window, "TableControl", timeout=self.dt.timeout)
-            if table:
-                grid = find_control(table, "GroupControl", timeout=3, Name="grid")
-            if not grid:
-                log.warning("File list control not found.")
-                return []
+            log.warning("File list control not found.")
+            return []
 
-        # Scroll the grid to load all files
-        scroll_to_bottom(grid, max_scrolls=30)
+        # Scroll the grid to load files
+        scroll_to_bottom(grid, max_scrolls=max_scrolls)
         time.sleep(0.5)
 
-        # Enumerate CustomControl children (each is a file row)
+        # Collect all candidate controls — file rows may be direct children
+        # of the grid or nested inside a container GroupControl.
+        candidates: list = []
+        for child in grid.GetChildren():
+            if child.Name and child.Name.strip():
+                candidates.append(child)
+            else:
+                # Unnamed container — check its children for file rows
+                for sub in child.GetChildren():
+                    if sub.Name and sub.Name.strip():
+                        candidates.append(sub)
+
+        # Parse filenames and timestamps from candidate controls
         files: List[FileInfo] = []
         seen_names: set = set()
-        for child in grid.GetChildren():
-            raw = child.Name.strip() if child.Name else ""
-            if not raw:
-                continue
+        for ctrl in candidates:
+            raw = ctrl.Name.strip()
             fname = self._parse_filename(raw)
             if not fname or fname in seen_names:
                 continue
@@ -336,7 +375,8 @@ class DingTalkController:
             if "Last update:" in raw and "." not in fname.split()[-1]:
                 continue
             seen_names.add(fname)
-            files.append(FileInfo(name=fname, control=child))
+            ts = self._parse_timestamp(raw)
+            files.append(FileInfo(name=fname, control=ctrl, timestamp=ts))
 
         log.info("Found %d files in list.", len(files))
         return files

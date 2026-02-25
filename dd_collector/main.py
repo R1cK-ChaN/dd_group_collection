@@ -105,7 +105,18 @@ def _process_group(
     dedup: DedupTracker,
     group: GroupConfig,
 ) -> None:
-    """Navigate to a group, list files, download new ones, move to GDrive."""
+    """Navigate to a group, list files, download new ones, move to GDrive.
+
+    Uses a two-layer filter:
+    1. **Watermark** — timestamp high-water mark; files at or before this are
+       skipped entirely (the list is sorted newest-first, so we ``break``).
+    2. **Filename dedup** — prevents re-downloading a file with the same name
+       even if its timestamp is newer than the watermark (edge case).
+
+    New files are downloaded **oldest-first** so the watermark advances
+    linearly.  If a download fails mid-batch the watermark is only advanced
+    up to the last success, and the next cycle picks up where it left off.
+    """
     log.info("Processing group: %s (alias: %s)", group.name, group.alias)
 
     controller.dismiss_dialogs()
@@ -118,19 +129,33 @@ def _process_group(
         log.warning("Skipping group (files tab failed): %s", group.name)
         return
 
-    files = controller.list_files()
+    # Incremental mode: only load the top of the list (new files are at top)
+    files = controller.list_files(max_scrolls=3)
     if not files:
         log.info("No files found in group: %s", group.name)
         return
 
-    # Filter out already-downloaded files
-    new_files = [
-        f for f in files
-        if not dedup.is_downloaded(group.name, f.name)
-    ]
+    # ── Watermark-based filtering ─────────────────────────────
+    watermark = dedup.get_watermark(group.name)
     log.info(
-        "Group '%s': %d total files, %d new.",
-        group.name, len(files), len(new_files),
+        "Group '%s': watermark=%s, visible files=%d",
+        group.name, watermark, len(files),
+    )
+
+    new_files: list[FileInfo] = []
+    for f in files:
+        # If watermark is set and this file's timestamp is at or before it,
+        # everything below is guaranteed older → stop scanning.
+        if watermark and f.timestamp and f.timestamp <= watermark:
+            break
+        # Skip files already in the dedup tracker (same filename)
+        if dedup.is_downloaded(group.name, f.name):
+            continue
+        new_files.append(f)
+
+    log.info(
+        "Group '%s': %d new files after watermark+dedup filter.",
+        group.name, len(new_files),
     )
 
     if not new_files:
@@ -145,11 +170,16 @@ def _process_group(
         )
         new_files = new_files[:cap]
 
+    # Download oldest-new-first so watermark advances linearly
+    new_files.reverse()
+
     # Take a snapshot of existing files in the download dir before downloading
     dl_dir = cfg.dingtalk.download_dir
     existing_before = _snapshot_download_dir(dl_dir)
 
     downloaded_count = 0
+    newest_downloaded_ts: str | None = None
+
     for file_info in new_files:
         try:
             success = _download_and_move(
@@ -158,6 +188,10 @@ def _process_group(
             )
             if success:
                 downloaded_count += 1
+                # Track the newest timestamp we've successfully downloaded
+                if file_info.timestamp:
+                    if newest_downloaded_ts is None or file_info.timestamp > newest_downloaded_ts:
+                        newest_downloaded_ts = file_info.timestamp
                 # Update snapshot after each successful download
                 existing_before = _snapshot_download_dir(dl_dir)
         except Exception as exc:
@@ -165,6 +199,10 @@ def _process_group(
                 "Error downloading '%s' from '%s': %s",
                 file_info.name, group.name, exc, exc_info=True,
             )
+
+    # Advance watermark to the newest successfully-downloaded timestamp
+    if newest_downloaded_ts:
+        dedup.set_watermark(group.name, newest_downloaded_ts)
 
     log.info(
         "Group '%s': downloaded %d / %d files.",

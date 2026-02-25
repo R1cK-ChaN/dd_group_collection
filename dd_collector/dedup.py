@@ -1,4 +1,8 @@
-"""JSON-based dedup tracker keyed by group::filename."""
+"""JSON-based dedup tracker keyed by group::filename.
+
+Also stores a per-group timestamp *watermark* so the incremental polling loop
+can skip files older than the last successful download.
+"""
 
 from __future__ import annotations
 
@@ -49,8 +53,37 @@ class DedupTracker:
         """Return list of filenames already downloaded for a group."""
         prefix = f"{group_name}::"
         return [
-            k[len(prefix):] for k in self._data if k.startswith(prefix)
+            k[len(prefix):] for k in self._data
+            if k.startswith(prefix) and not k.startswith("__watermark__::")
         ]
+
+    # ── Watermark (incremental high-water mark) ──────────────
+
+    _WATERMARK_PREFIX = "__watermark__::"
+
+    def get_watermark(self, group_name: str) -> Optional[str]:
+        """Return the last-downloaded timestamp string for *group_name*.
+
+        Format matches DingTalk file row timestamps: ``'2025/07/02 13:52'``.
+        Returns ``None`` if no watermark has been set yet.
+        """
+        key = f"{self._WATERMARK_PREFIX}{group_name}"
+        entry = self._data.get(key)
+        if isinstance(entry, dict):
+            return entry.get("timestamp_str")
+        return None
+
+    def set_watermark(self, group_name: str, timestamp_str: str) -> None:
+        """Persist the high-water mark for *group_name*."""
+        key = f"{self._WATERMARK_PREFIX}{group_name}"
+        self._data[key] = {
+            "timestamp_str": timestamp_str,
+            "updated": time.time(),
+        }
+        self._save()
+        log.info(
+            "Watermark updated for '%s': %s", group_name, timestamp_str,
+        )
 
     # ── Internal ─────────────────────────────────────────────
 
