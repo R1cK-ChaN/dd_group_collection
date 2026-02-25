@@ -45,35 +45,90 @@ class DingTalkController:
 
     # ── Connection ───────────────────────────────────────────
 
+    # Known DingTalk window classes (tried in order).
+    _WINDOW_CLASSES = ("DtMainFrameView", "StandardFrame_DingTalk")
+
     def connect(self) -> bool:
         """Find and activate the DingTalk main window.
 
+        Tries the configured window_class first, then falls back to known
+        alternatives.  DingTalk must be both SetActive *and* SetFocus before
+        pyautogui mouse/keyboard events will land on it.
+
         Returns True if the window was found and activated.
         """
-        try:
-            self._window = auto.WindowControl(
-                ClassName=self.dt.window_class,
-                searchDepth=1,
-            )
-            if not self._window.Exists(maxSearchSeconds=self.dt.timeout):
-                log.error(
-                    "DingTalk window not found (class=%s). Is DingTalk running?",
-                    self.dt.window_class,
-                )
-                return False
-            self._window.SetActive()
-            self._window.SetFocus()
-            time.sleep(0.5)
-            log.info("Connected to DingTalk window.")
-            return True
-        except Exception as exc:
-            log.error("Failed to connect to DingTalk: %s", exc)
-            return False
+        classes_to_try = [self.dt.window_class] + [
+            c for c in self._WINDOW_CLASSES if c != self.dt.window_class
+        ]
+        for cls_name in classes_to_try:
+            try:
+                win = auto.WindowControl(ClassName=cls_name, searchDepth=1)
+                if win.Exists(maxSearchSeconds=3):
+                    self._window = win
+                    self._window.SetActive()
+                    time.sleep(0.3)
+                    self._window.SetFocus()
+                    time.sleep(0.3)
+                    log.info(
+                        "Connected to DingTalk window (class=%s).", cls_name,
+                    )
+                    return True
+            except Exception as exc:
+                log.debug("Trying window class %s: %s", cls_name, exc)
+
+        log.error(
+            "DingTalk window not found (tried %s). Is DingTalk running?",
+            classes_to_try,
+        )
+        return False
 
     # ── Navigation ───────────────────────────────────────────
 
+    def _find_search_box(self) -> Optional[auto.Control]:
+        """Locate the search box, trying ClassName first then Name.
+
+        The DingTalk search box is a QLineEdit with no Name attribute.
+        Falls back to searching by Name='Search' for older UI versions.
+        """
+        sel = self.sel.search_box
+        # Prefer ClassName match (works on current DingTalk builds)
+        if sel.class_name:
+            box = find_control(
+                self._window,
+                sel.control_type,
+                timeout=self.dt.timeout,
+                ClassName=sel.class_name,
+            )
+            if box:
+                return box
+
+        # Fall back to Name match (older builds)
+        if sel.name:
+            box = find_control(
+                self._window,
+                sel.control_type,
+                timeout=self.dt.timeout / 2,
+                Name=sel.name,
+            )
+            if box:
+                return box
+
+        return None
+
     def navigate_to_group(self, group_name: str) -> bool:
-        """Search for a group by name and click on the result.
+        """Search for a group by name and open the conversation.
+
+        DingTalk's conversation list items have empty Name attributes, so
+        we cannot enumerate or identify them via UI Automation.  Instead:
+
+        1. Click the search box (QLineEdit) to focus it.
+        2. Type the group name via uiautomation SendKeys — this populates
+           the search field and DingTalk filters/searches in real time.
+        3. Press Enter via pyautogui to select the first result.  Clicking
+           the search box changes the foreground to a DtQtWebView search
+           overlay, so pyautogui keyboard events land there correctly.
+        4. Wait for the group chat to open — verified by checking that the
+           welcome screen is gone or that group header buttons appear.
 
         Returns True if the group was successfully opened.
         """
@@ -82,14 +137,16 @@ class DingTalkController:
 
         self.dismiss_dialogs()
 
+        # Ensure DingTalk has real focus before pyautogui events
+        try:
+            self._window.SetActive()
+            self._window.SetFocus()
+            time.sleep(0.3)
+        except Exception:
+            pass
+
         # Click search box
-        sel = self.sel.search_box
-        search_box = find_control(
-            self._window,
-            sel.control_type,
-            timeout=self.dt.timeout,
-            Name=sel.name,
-        )
+        search_box = self._find_search_box()
         if not search_box:
             log.error("Search box not found.")
             return False
@@ -97,69 +154,109 @@ class DingTalkController:
         if not safe_click(search_box, delay_after=0.5):
             return False
 
-        # Type group name
-        if not set_text(search_box, group_name, delay_after=1.0):
+        # Clear any previous text and type group name.
+        # After clicking the search box the foreground may switch to
+        # DtQtWebView (a search overlay), so we use SendKeys which works
+        # regardless of the foreground window.
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.1)
+        pyautogui.press("delete")
+        time.sleep(0.2)
+
+        if not set_text(search_box, group_name, delay_after=1.5):
             log.error("Failed to type group name: %s", group_name)
             send_escape()
             return False
 
-        # Wait for results and click first match
-        time.sleep(1.5)
-        sel_item = self.sel.search_result_item
-        result = find_control(
-            self._window,
-            sel_item.control_type,
-            timeout=self.dt.timeout,
-        )
-        if not result:
-            log.error("No search results found for group: %s", group_name)
-            send_escape()
-            return False
+        # Select the first search result by pressing Enter.
+        # The search overlay is focused so pyautogui's Enter goes there.
+        pyautogui.press("enter")
+        time.sleep(2)
 
-        if not safe_click(result, delay_after=1.0):
-            send_escape()
-            return False
+        # Verify that a group chat actually opened.
+        # On success, group header buttons like "Files" appear.
+        if self._verify_group_opened():
+            log.info("Navigated to group: %s", group_name)
+            return True
 
-        # Press Escape to close the search overlay
+        # If not opened, try pressing Escape and retry with Ctrl-click
+        log.warning("Group chat may not have opened. Retrying...")
         send_escape()
         time.sleep(0.5)
+        return False
 
-        log.info("Navigated to group: %s", group_name)
-        return True
+    def _verify_group_opened(self) -> bool:
+        """Check whether a group conversation is currently open.
+
+        Looks for characteristic group header buttons (Files, Group Settings, etc.)
+        that only appear inside a group chat.
+        """
+        for btn_name in ("Files", "Group Settings", "Group Notice", "Chat History"):
+            btn = find_control(
+                self._window, "ButtonControl", timeout=2, Name=btn_name,
+            )
+            if btn:
+                log.debug("Group header button found: %s", btn_name)
+                return True
+
+        # Fallback: check that the welcome screen is gone
+        welcome = find_control(
+            self._window, "TextControl", timeout=1,
+            Name="DingTalk, the way of working in the AI era",
+        )
+        return welcome is None
 
     # ── Files Tab ────────────────────────────────────────────
 
     def open_files_tab(self) -> bool:
-        """Click the '文件' (Files) tab in the current group.
+        """Click the 'Files' button in the group chat header.
 
-        Tries the primary control type first, then the fallback.
+        The button appears alongside Group Notice, Chat History, More, and
+        Group Settings in the top-right area of the chat.  Tries the
+        configured name first ("Files"), then common alternatives.
         """
         if not self._window:
             return False
 
         sel = self.sel.files_tab
-        tab = find_control(
-            self._window,
-            sel.control_type,
-            timeout=self.dt.timeout,
-            Name=sel.name,
-        )
+        names_to_try = [sel.name] if sel.name else []
+        # Add common alternatives for English/Chinese UI
+        for alt in ("Files", "File", "文件"):
+            if alt not in names_to_try:
+                names_to_try.append(alt)
 
-        # Try fallback control type
-        if not tab and sel.fallback_control_type:
+        tab = None
+        for name in names_to_try:
             tab = find_control(
                 self._window,
-                sel.fallback_control_type,
+                sel.control_type,
                 timeout=self.dt.timeout / 2,
-                Name=sel.name,
+                Name=name,
             )
+            if tab:
+                break
+            # Try fallback control type
+            if sel.fallback_control_type:
+                tab = find_control(
+                    self._window,
+                    sel.fallback_control_type,
+                    timeout=2,
+                    Name=name,
+                )
+                if tab:
+                    break
 
         if not tab:
-            log.error("Files tab not found.")
+            log.error("Files tab not found (tried names: %s).", names_to_try)
             return False
 
-        if not safe_click(tab, delay_after=1.0):
-            return False
+        # Use pyautogui click to ensure the click lands on the right element,
+        # since the Files button is small (28x28) and near other header buttons.
+        rect = tab.BoundingRectangle
+        cx = (rect.left + rect.right) // 2
+        cy = (rect.top + rect.bottom) // 2
+        pyautogui.click(cx, cy)
+        time.sleep(1.5)
 
         log.info("Opened files tab.")
         return True

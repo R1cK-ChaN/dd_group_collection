@@ -61,6 +61,7 @@ class SelectorConfig:
     control_type: str = ""
     name: str = ""
     fallback_control_type: str = ""
+    class_name: str = ""  # ClassName for controls identified by class rather than name
 
 
 @dataclass
@@ -95,6 +96,7 @@ def _build_selector(data: Any) -> SelectorConfig:
         control_type=data.get("control_type", ""),
         name=data.get("name", ""),
         fallback_control_type=data.get("fallback_control_type", ""),
+        class_name=data.get("class_name", ""),
     )
 
 

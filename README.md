@@ -14,10 +14,10 @@ Uses RPA-style UI automation (`uiautomation`) to drive the DingTalk PC client �
 | Config paths | Done | download_dir, gdrive base_path set for user `vm` |
 | Google Drive sync | Verified | Files placed in `G:\My Drive\DingTalk Files\` sync to cloud |
 | Auto-start on boot | Done | `dd_group_collection.bat` in `shell:startup` |
-| Connect to DingTalk | Working | Window class `StandardFrame_DingTalk` found |
-| Navigate to group | Working | Search box (`EditControl Name='Search'`) works; `set_text` falls back to `SendKeys` |
-| Open Files tab | Working | `ButtonControl Name='File'` clicks successfully |
-| List files | **Blocked** | CefBrowserWindow accessibility tree not exposed; see **Known Issues #1** |
+| Connect to DingTalk | Working | Window class `DtMainFrameView` (was `StandardFrame_DingTalk`) |
+| Navigate to group | Working | Search box `QLineEdit` → `SendKeys` → `Enter` selects first result |
+| Open Files tab | Working | `ButtonControl Name='Files'` (was `'File'`) in group header |
+| List files | **Blocked** | CefBrowserWindow accessibility tree still empty after registry fix |
 | Download files | **Blocked** | Depends on list_files; pyautogui hover approach ready but untested |
 | Move to GDrive | Not yet tested | Depends on download working |
 
@@ -32,8 +32,9 @@ The Files tab renders inside a Chromium Embedded Framework web view (`CefBrowser
 - Starting Windows Narrator to trigger Chromium accessibility — no effect
 - Searching with `searchDepth=15` — no deeper controls found
 - Checking for Chrome DevTools Protocol (CDP) ports — none open
+- **Registry fix (2026-02-25):** Set `HKCU\Software\Chromium\Accessibility\AXMode=1` and `HKCU\Software\Google\Chrome\Accessibility\AXMode=1`, restarted DingTalk — **tree still empty**. DingTalk's CEF build appears to ignore these standard Chromium accessibility flags.
 
-**Current CefBrowserWindow tree (empty):**
+**Current CefBrowserWindow tree (still empty after registry fix):**
 ```
 PaneControl (Class='CefBrowserWindow')
  └─ PaneControl (Class='Chrome_WidgetWin_1')
@@ -43,12 +44,12 @@ PaneControl (Class='CefBrowserWindow')
 
 **Native controls that ARE visible** (proving the files tab is open):
 - `ButtonControl Name='Upload File'` at (594,626)
-- `ButtonControl Name='Files'` at (1164,50)
+- `ButtonControl Name='Files'` at (986,106)
 
-**Possible solutions to investigate:**
-1. Launch DingTalk with `--force-renderer-accessibility` flag
-2. Set Chromium accessibility via registry (`HKCU\Software\Chromium\Accessibility`)
-3. Use screenshot + VLM/OCR to identify file rows visually and click by coordinates
+**Remaining solutions to investigate:**
+1. ~~Set Chromium accessibility via registry~~ — tried, did not work
+2. ~~Launch DingTalk with `--force-renderer-accessibility` flag~~ — DingTalk launcher does not pass flags to CEF
+3. **Use screenshot + OCR to identify file rows visually and click by coordinates** — next approach
 4. Inject CDP access by modifying DingTalk's CEF launch flags
 5. Use keyboard navigation (Tab/Arrow) to select files within the web view
 
@@ -68,7 +69,14 @@ The `dismiss_buttons` config originally included `"Close"` and `"关闭"`, which
 
 ### 4. Second group navigation can fail
 
-Searching for `资料分享群` returned no results in one test. May be caused by leftover text in the search box or timing issues. Needs investigation.
+Searching for `资料分享群` returned no results in one test. Root cause identified: leftover text in the search box from the previous search. **Fixed** by clearing the search box with `Ctrl+A` → `Delete` before typing the new group name.
+
+### 5. Python 3.14 — Pillow / pyscreeze not supported
+
+`pyautogui.screenshot()` fails because Pillow has not released a build compatible with Python 3.14. This blocks any screenshot-based approach using pyautogui. Alternatives:
+- Use `mss` (pure-Python screenshot library) instead of Pillow
+- Use Windows native screenshot via `ctypes` / `win32api`
+- Downgrade to Python 3.12/3.13
 
 ## Requirements
 
@@ -134,31 +142,71 @@ Note: the startup copy must `cd /d` to the project directory. The deployed versi
                     └──────────────────────────────────────────────────────────┘
 ```
 
-## DingTalk UI Control Tree (Files Tab)
+## DingTalk UI Control Tree
 
-Discovered via `tools/inspect_dingtalk.py` and manual inspection:
+Discovered via `tools/inspect_dingtalk.py` and manual inspection (updated 2026-02-25).
+
+### Current layout (DtMainFrameView)
+
+```
+WindowControl Name='DingTalk' Class='DtMainFrameView'
+ ├─ WindowControl Class='DingChatWnd'
+ │   ├─ WindowControl Name='ConvTabListView' Class='ConvListView'
+ │   │   └─ GroupControl > QStackedWidget > GroupControl
+ │   │       └─ (conversation items — Names are EMPTY, not accessible)
+ │   ├─ WindowControl Name='ConvTabTopBar' Class='ConvTabTopBarV2'
+ │   │   └─ QStackedWidget > GroupControl
+ │   └─ WindowControl (right panel — group chat content)
+ │       ├─ WindowControl Name='DTIMContentModule'              ← chat messages
+ │       ├─ ButtonControl Name='Group Notice'                   ← group header
+ │       ├─ ButtonControl Name='Files'                          ← ** FILES TAB **
+ │       ├─ ButtonControl Name='Chat History'
+ │       ├─ ButtonControl Name='More'
+ │       └─ ButtonControl Name='Group Settings'
+ ├─ GroupControl Class='QWidget'
+ │   ├─ GroupControl Class='client_ding::TitlebarView'
+ │   │   └─ EditControl Class='QLineEdit'                      ← ** SEARCH BOX ** (no Name!)
+ │   ├─ GroupControl Class='client_ding::NavigatorView'
+ │   │   ├─ ButtonControl Name='Standard Edition'
+ │   │   ├─ ButtonControl Name='Messages'
+ │   │   └─ ButtonControl Name='More'
+ │   └─ GroupControl Class='main_frame::DtContentAreaView'
+ └─ GroupControl Class='ddesign::TopWindowToolBar'
+     ├─ ButtonControl Name='Minimize'
+     ├─ ButtonControl Name='Maximize'
+     └─ ButtonControl Name='Close'
+```
+
+### Files tab (CefBrowserWindow — accessibility tree EMPTY)
+
+```
+PaneControl Class='CefBrowserWindow'  (inside right panel after clicking Files)
+ └─ PaneControl Class='Chrome_WidgetWin_1'
+     └─ PaneControl
+         └─ CustomControl  (no Name, no children — NOT ACCESSIBLE)
+```
+
+### Legacy layout (StandardFrame_DingTalk) — no longer seen
 
 ```
 WindowControl (Class='StandardFrame_DingTalk')
- ├─ WindowControl (Class='ChatFileWnd')          ← Files tab window
- │   └─ PaneControl (Class='CefBrowserWindow')   ← Chromium web view
+ ├─ WindowControl (Class='ChatFileWnd')
+ │   └─ PaneControl (Class='CefBrowserWindow')
  │       └─ DocumentControl (Class='Chrome_RenderWidgetHostHWND', Name='群文件-Online')
- │           ├─ GroupControl (AutoId='root')
- │           │   ├─ TextControl Name='File' / 'Media' / 'Link'   ← tab filters
- │           │   ├─ ButtonControl Name='Upload/Create'
- │           │   ├─ CheckBoxControl / HeaderControl               ← select-all / sort
- │           │   ├─ GroupControl Name='grid'                      ← ** file list **
- │           │   │   └─ GroupControl (container)
- │           │   │       ├─ CustomControl Name='  filename.pdf 125.1 KB  ·date author'
- │           │   │       └─ ...
- │           │   ├─ EditControl Name='Search files'
- │           │   └─ TextControl Name='Recycle Bin'
- │           └─ GroupControl (AutoId='transfer-file-task-container')
- └─ WindowControl (title bar)
-     ├─ EditControl Name='Search'                 ← main search box
-     ├─ ButtonControl Name='Minimize' / 'Maximize' / 'Close'  ← title bar buttons
-     └─ ...
+ │           └─ GroupControl Name='grid'                        ← file list (was accessible)
+ └─ EditControl Name='Search'                                  ← search box (had a Name)
 ```
+
+### Key behavioral notes
+
+- **Search box** has no Name — must be found by `ClassName='QLineEdit'`.
+- **Conversation list items** all have empty Name attributes — cannot be enumerated.
+- **Navigation** works by typing in the search box via `SendKeys`, then pressing `Enter`
+  (via pyautogui) to select the first search result.
+- After clicking the search box, the foreground window changes to `DtQtWebView`
+  (a search overlay), so pyautogui keyboard events land there correctly.
+- DingTalk must have **both** `SetActive()` and `SetFocus()` before pyautogui
+  mouse/keyboard events will reach it.
 
 ## Module Dependency Graph
 

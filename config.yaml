@@ -3,8 +3,9 @@
 
 # ── DingTalk settings ──
 dingtalk:
-  # Window class name used to find the DingTalk main window
-  window_class: "StandardFrame_DingTalk"
+  # Window class name used to find the DingTalk main window.
+  # Known classes: "DtMainFrameView" (current), "StandardFrame_DingTalk" (legacy)
+  window_class: "DtMainFrameView"
   # Where DingTalk saves downloaded files (check DingTalk settings)
   download_dir: "C:\\Users\\vm\\Documents\\DingDing\\download"
   # Seconds to wait for UI controls to appear
@@ -52,12 +53,15 @@ logging:
 ui_selectors:
   search_box:
     control_type: "EditControl"
-    name: "Search"
+    # Name is empty — match by ClassName instead.
+    # The search box is a QLineEdit in the top bar.
+    name: ""
+    class_name: "QLineEdit"
   search_result_item:
     control_type: "ListItemControl"
   files_tab:
     control_type: "ButtonControl"
-    name: "File"
+    name: "Files"
     # Fallback if ButtonControl doesn't match
     fallback_control_type: "TabItemControl"
   file_list:
