@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import AppConfig, GroupConfig, load_config
 from .dedup import DedupTracker
-from .dingtalk_ui import ChatAttachment, DingTalkController, FileInfo
+from .dingtalk_ui import ChatAttachment, DingTalkController
 from .file_mover import get_new_files, move_file_to_gdrive
 from .logger import setup_logging
 from .ui_helpers import send_escape

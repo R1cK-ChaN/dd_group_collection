@@ -41,13 +41,15 @@ class ChatAttachment:
     """A downloadable attachment found in a DingTalk chat message.
 
     Two types:
-    - file_card: PDF/XLSX/etc rendered as a card with a native Download button.
+    - file_card: PDF/XLSX/etc rendered as a card with a Download button.
+      All chat content is web-rendered in CefBrowserWindow (invisible to UIA),
+      so we use VLM to find the Download button coordinates.
     - image: Inline image preview; requires right-click → context menu to download.
     """
     msg_type: str  # "file_card" or "image"
     filename: str
     timestamp: Optional[str] = None  # "YYYY/MM/DD HH:MM"
-    download_button: Optional[auto.Control] = None  # for file_card type
+    download_click: Optional[Tuple[int, int]] = None  # screen-absolute (x, y) for file_card
     image_bounds: Optional[Tuple[int, int, int, int]] = None  # for image type
 
 
@@ -840,8 +842,8 @@ class DingTalkController:
         seen_keys: set = set()
 
         for scroll_i in range(max_scrolls + 1):  # +1 for the initial view
-            # Phase 1: file cards via UIA (fast, no API cost)
-            cards = self._scan_file_cards_uia()
+            # Phase 1: file cards via VLM (CefBrowserWindow blocks UIA)
+            cards = self._scan_file_cards_vlm()
             for card in cards:
                 key = f"{card.timestamp}::{card.filename}"
                 if key not in seen_keys:
@@ -870,186 +872,65 @@ class DingTalkController:
         )
         return all_attachments
 
-    # ── File Card Scanning (UIA) ──────────────────────────────
+    # ── File Card Scanning (VLM) ──────────────────────────────
 
-    def _scan_file_cards_uia(self) -> List[ChatAttachment]:
-        """Find file cards by locating native Download buttons via UIA.
+    def _scan_file_cards_vlm(self) -> List[ChatAttachment]:
+        """Find file cards by asking the VLM to locate Download buttons.
 
-        File cards in DingTalk chat render with a visible "Download"
-        ButtonControl.  We walk the control tree to find all such buttons
-        and extract the filename/timestamp from nearby controls.
+        DingTalk renders file cards inside CefBrowserWindow (Chromium),
+        making them invisible to UIA.  We screenshot the chat area and
+        ask the VLM to identify file cards with their filenames and
+        Download button coordinates.
         """
-        results: List[ChatAttachment] = []
-        buttons = self._find_all_controls_by_name("ButtonControl", "Download")
-        log.debug("UIA scan: found %d Download buttons.", len(buttons))
+        from .vlm import find_file_card_downloads, grab_screenshot_base64
 
-        for btn in buttons:
-            rect = btn.BoundingRectangle
+        vlm_cfg = self.cfg.vlm
+        if not vlm_cfg.api_key:
+            log.debug("No VLM API key — skipping file card scan.")
+            return []
+
+        if not self._window:
+            return []
+
+        try:
+            rect = self._window.BoundingRectangle
             if rect.width() <= 0 or rect.height() <= 0:
-                continue
+                return []
 
-            filename = self._extract_card_filename(btn)
-            if not filename:
-                log.debug(
-                    "Skipping Download button at (%d,%d) — "
-                    "could not extract filename.",
-                    rect.left, rect.top,
-                )
-                continue
+            # Capture the chat area (right ~70% of the window, skip sidebar)
+            chat_left = rect.left + int(rect.width() * 0.3)
+            region = (chat_left, rect.top, rect.right, rect.bottom)
 
-            timestamp = self._extract_nearby_timestamp(btn)
-            results.append(ChatAttachment(
-                msg_type="file_card",
-                filename=filename,
-                timestamp=timestamp,
-                download_button=btn,
-            ))
+            screenshot_b64 = grab_screenshot_base64(region)
+            img_w = rect.right - chat_left
+            img_h = rect.bottom - rect.top
 
-        return results
+            cards = find_file_card_downloads(
+                api_key=vlm_cfg.api_key,
+                screenshot_b64=screenshot_b64,
+                image_size=(img_w, img_h),
+                model=vlm_cfg.model,
+                base_url=vlm_cfg.base_url,
+            )
 
-    def _find_all_controls_by_name(
-        self,
-        control_type_name: str,
-        name: str,
-        max_depth: int = 15,
-    ) -> list:
-        """Walk the UI tree to find ALL controls matching type and name.
+            results: List[ChatAttachment] = []
+            for card in cards:
+                # Convert image-relative coords to screen-absolute
+                abs_x = card["x"] + chat_left
+                abs_y = card["y"] + rect.top
 
-        Unlike find_control() which returns only the first match, this
-        recursively walks children to collect every match.
+                results.append(ChatAttachment(
+                    msg_type="file_card",
+                    filename=card["filename"],
+                    timestamp=None,  # VLM doesn't reliably extract timestamps
+                    download_click=(abs_x, abs_y),
+                ))
 
-        Args:
-            control_type_name: e.g. "ButtonControl", "TextControl".
-            name: Required Name property value.
-            max_depth: Maximum tree depth to traverse.
-        """
-        results: list = []
+            return results
 
-        def _walk(ctrl: auto.Control, depth: int) -> None:
-            if depth > max_depth:
-                return
-            try:
-                if (
-                    ctrl.ControlTypeName == control_type_name
-                    and ctrl.Name == name
-                ):
-                    results.append(ctrl)
-                for child in ctrl.GetChildren():
-                    _walk(child, depth + 1)
-            except Exception:
-                pass
-
-        if self._window:
-            _walk(self._window, 0)
-        return results
-
-    def _extract_card_filename(
-        self, download_btn: auto.Control,
-    ) -> Optional[str]:
-        """Extract the filename from a file card containing a Download button.
-
-        Walks up the parent chain and inspects sibling/child text controls
-        for a filename pattern (string ending with a file extension).
-        """
-        import re
-
-        ctrl = download_btn
-        for _ in range(5):
-            parent = ctrl.GetParentControl()
-            if parent is None:
-                break
-            try:
-                for child in parent.GetChildren():
-                    text = (child.Name or "").strip()
-                    if not text:
-                        continue
-
-                    # Direct match: "report.pdf"
-                    if re.search(r"\.\w{2,5}$", text):
-                        return text
-
-                    # Match with trailing size: "report.pdf  2.9 MB"
-                    m = re.match(r"(.+?\.\w{2,5})\s", text)
-                    if m:
-                        return m.group(1).strip()
-
-                    # Match CJK + extension in longer text:
-                    # "高盛亚洲交易台-260226.PDF"
-                    m = re.search(
-                        r"([\w\-\.\u4e00-\u9fff]+\.\w{2,5})", text,
-                    )
-                    if m:
-                        return m.group(1).strip()
-            except Exception:
-                pass
-            ctrl = parent
-
-        log.debug("Could not extract filename from file card via UIA tree.")
-        return None
-
-    def _extract_nearby_timestamp(
-        self, ctrl: auto.Control,
-    ) -> Optional[str]:
-        """Extract a timestamp from controls near the given control.
-
-        DingTalk chat shows timestamps like "10:37", "Today 11:01",
-        "Yesterday 14:30", or "2025/02/26 10:37" near messages.
-        Walks up the parent chain and checks siblings for time patterns.
-        """
-        import re
-        from datetime import datetime, timedelta
-
-        parent = ctrl
-        for _ in range(5):
-            parent = parent.GetParentControl()
-            if parent is None:
-                break
-
-            try:
-                for child in parent.GetChildren():
-                    text = (child.Name or "").strip()
-                    if not text:
-                        continue
-
-                    # Absolute: "2025/02/26 10:37"
-                    m = re.search(
-                        r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", text,
-                    )
-                    if m:
-                        return m.group(1)
-
-                    # "Today 10:37"
-                    m = re.search(r"Today\s+(\d{2}:\d{2})", text)
-                    if m:
-                        today = datetime.now().strftime("%Y/%m/%d")
-                        return f"{today} {m.group(1)}"
-
-                    # "Yesterday 14:30"
-                    m = re.search(r"Yesterday\s+(\d{2}:\d{2})", text)
-                    if m:
-                        yest = (
-                            datetime.now() - timedelta(days=1)
-                        ).strftime("%Y/%m/%d")
-                        return f"{yest} {m.group(1)}"
-
-                    # Bare time "10:37" (assume today)
-                    m = re.fullmatch(r"(\d{1,2}:\d{2})", text)
-                    if m:
-                        today = datetime.now().strftime("%Y/%m/%d")
-                        return f"{today} {m.group(1)}"
-
-                    # "02-26 10:37" (no year)
-                    m = re.search(
-                        r"(\d{2}-\d{2})\s+(\d{2}:\d{2})", text,
-                    )
-                    if m:
-                        year = datetime.now().strftime("%Y")
-                        date_part = m.group(1).replace("-", "/")
-                        return f"{year}/{date_part} {m.group(2)}"
-            except Exception:
-                pass
-
-        return None
+        except Exception as exc:
+            log.warning("VLM file card scan failed: %s", exc)
+            return []
 
     # ── Image Scanning (VLM) ──────────────────────────────────
 
@@ -1133,56 +1014,33 @@ class DingTalkController:
         return False
 
     def _download_file_card(self, att: ChatAttachment) -> bool:
-        """Download a file card by clicking its native Download button.
+        """Download a file card by clicking its Download button coordinates.
 
-        Strategy 1: UIA Click on the ButtonControl.
-        Strategy 2: pyautogui click at button center (if UIA fails).
+        The Download button is web-rendered in CefBrowserWindow (invisible
+        to UIA).  We use the screen-absolute coordinates found by VLM.
         """
-        if not att.download_button:
-            log.warning("No Download button reference for: %s", att.filename)
+        if not att.download_click:
+            log.warning("No Download click coords for: %s", att.filename)
             return False
 
         self._ensure_focus()
 
-        # Strategy 1: UIA click
+        cx, cy = att.download_click
         try:
-            att.download_button.Click(simulateMove=False)
+            pyautogui.click(cx, cy)
             time.sleep(0.5)
             self._handle_save_dialog()
             time.sleep(self.dt.download_wait)
             log.info(
-                "Download triggered (file card UIA): %s", att.filename,
+                "Download triggered (file card VLM click): %s", att.filename,
             )
             return True
         except Exception as exc:
-            log.debug(
-                "UIA click failed for file card '%s': %s",
-                att.filename, exc,
+            log.error(
+                "Click failed for file card '%s' at (%d,%d): %s",
+                att.filename, cx, cy, exc,
             )
-
-        # Strategy 2: pyautogui click at button center
-        try:
-            rect = att.download_button.BoundingRectangle
-            if rect.width() > 0 and rect.height() > 0:
-                cx = (rect.left + rect.right) // 2
-                cy = (rect.top + rect.bottom) // 2
-                pyautogui.click(cx, cy)
-                time.sleep(0.5)
-                self._handle_save_dialog()
-                time.sleep(self.dt.download_wait)
-                log.info(
-                    "Download triggered (file card pyautogui): %s",
-                    att.filename,
-                )
-                return True
-        except Exception as exc:
-            log.debug(
-                "pyautogui click failed for file card '%s': %s",
-                att.filename, exc,
-            )
-
-        log.error("Failed to download file card: %s", att.filename)
-        return False
+            return False
 
     def _download_image_attachment(self, att: ChatAttachment) -> bool:
         """Download an image attachment via right-click context menu.

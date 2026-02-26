@@ -4,7 +4,7 @@
 
 # ── DingTalk settings ──
 dingtalk:
-  window_class: "DtMainFrameView"
+  window_class: "StandardFrame_DingTalk"
   download_dir: "C:\\Users\\YOUR_USER\\Documents\\DingDing\\download"
   timeout: 10
   download_wait: 5

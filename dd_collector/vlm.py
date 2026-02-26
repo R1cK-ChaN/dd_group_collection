@@ -18,6 +18,16 @@ import mss.tools
 log = logging.getLogger("dd_collector")
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from VLM responses.
+
+    Thinking models (e.g. Qwen 3.5) emit reasoning in <think> tags that
+    may contain sentinel keywords like NOT_FOUND / NO_FILES / NO_IMAGES,
+    causing false-positive early returns.
+    """
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 def grab_screenshot_base64(
     region: Optional[Tuple[int, int, int, int]] = None,
 ) -> str:
@@ -138,17 +148,18 @@ def find_menu_item_coords(
             temperature=0,
         )
 
-        reply = resp.choices[0].message.content.strip()
+        reply = _strip_thinking(resp.choices[0].message.content.strip())
         log.debug("VLM reply: %s", reply)
 
-        if "NOT_FOUND" in reply.upper():
-            log.warning("VLM could not find '%s' in screenshot.", target_label)
-            return None
-
-        # Parse "x,y" from the reply (may contain extra text)
+        # Parse "x,y" from the reply (may contain extra text).
+        # Check for coordinates BEFORE sentinel — thinking models sometimes
+        # emit both a result and the sentinel in the same response.
         m = re.search(r"(\d+)\s*,\s*(\d+)", reply)
         if not m:
-            log.warning("VLM reply not parseable as coordinates: %s", reply)
+            if "NOT_FOUND" in reply.upper():
+                log.warning("VLM could not find '%s' in screenshot.", target_label)
+            else:
+                log.warning("VLM reply not parseable as coordinates: %s", reply)
             return None
 
         x, y = int(m.group(1)), int(m.group(2))
@@ -246,17 +257,16 @@ def find_icon_coords(
             temperature=0,
         )
 
-        reply = resp.choices[0].message.content.strip()
+        reply = _strip_thinking(resp.choices[0].message.content.strip())
         log.debug("VLM icon reply: %s", reply)
 
-        if "NOT_FOUND" in reply.upper():
-            log.warning("VLM could not find download icon in screenshot.")
-            return None
-
-        # Parse "x,y" from the reply (may contain extra text)
+        # Parse "x,y" before checking sentinel — model may emit both.
         m = re.search(r"(\d+)\s*,\s*(\d+)", reply)
         if not m:
-            log.warning("VLM icon reply not parseable as coordinates: %s", reply)
+            if "NOT_FOUND" in reply.upper():
+                log.warning("VLM could not find download icon in screenshot.")
+            else:
+                log.warning("VLM icon reply not parseable as coordinates: %s", reply)
             return None
 
         x, y = int(m.group(1)), int(m.group(2))
@@ -345,11 +355,11 @@ def find_image_attachments(
             temperature=0,
         )
 
-        reply = resp.choices[0].message.content.strip()
+        reply = _strip_thinking(resp.choices[0].message.content.strip())
         log.debug("VLM image scan reply: %s", reply)
 
-        if "NO_IMAGES" in reply.upper():
-            return []
+        # Skip sentinel check — model may emit both results and NO_IMAGES.
+        # The parsing loop naturally returns [] if nothing is found.
 
         # Parse bounding boxes from "image_N: left,top,right,bottom" lines
         boxes: list = []
@@ -381,4 +391,119 @@ def find_image_attachments(
 
     except Exception as exc:
         log.error("VLM image scan API call failed: %s", exc)
+        return []
+
+
+def find_file_card_downloads(
+    api_key: str,
+    screenshot_b64: str,
+    image_size: Optional[Tuple[int, int]] = None,
+    model: str = "qwen/qwen3.5-35b-a3b",
+    base_url: str = "https://openrouter.ai/api/v1",
+) -> list:
+    """Ask a VLM to find file attachment cards and their Download buttons.
+
+    DingTalk renders file cards inside a CefBrowserWindow (Chromium) so they
+    are invisible to Windows UI Automation.  This function asks the VLM to
+    visually locate each file card and return:
+    - The filename shown on the card
+    - The (x, y) pixel coordinates of the "Download" button center
+
+    Returns a list of dicts:
+        [{"filename": "report.pdf", "x": 520, "y": 185}, ...]
+
+    Coordinates are relative to the screenshot image.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    size_hint = ""
+    if image_size:
+        size_hint = (
+            f"The image is {image_size[0]}x{image_size[1]} pixels. "
+            f"Coordinates must be within 0-{image_size[0] - 1} for x "
+            f"and 0-{image_size[1] - 1} for y. "
+        )
+
+    prompt = (
+        "Look at this screenshot of a DingTalk chat conversation. "
+        f"{size_hint}"
+        "Find all FILE ATTACHMENT CARDS in the chat messages. "
+        "These are rectangular cards that show:\n"
+        "- A file icon on the left\n"
+        "- A filename (e.g. report.pdf, data.xlsx, 通知.docx)\n"
+        "- File size text\n"
+        "- One or more action buttons (Download/下载, Add to DingPan/加入钉盘)\n\n"
+        "Do NOT include:\n"
+        "- Inline image previews (photos/screenshots shared directly)\n"
+        "- Text messages or system messages\n"
+        "- User avatars or UI icons\n\n"
+        "For each file card, return the filename and the pixel coordinates "
+        "of the CENTER of the Download (下载) button, one per line:\n"
+        "file_1: filename.pdf, 520,185\n"
+        "file_2: data.xlsx, 530,290\n\n"
+        "The format is: file_N: <filename>, <x>,<y>\n\n"
+        "If no file cards are found, reply: NO_FILES"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{screenshot_b64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=500,
+            temperature=0,
+        )
+
+        reply = _strip_thinking(resp.choices[0].message.content.strip())
+        log.debug("VLM file card reply: %s", reply)
+
+        # Skip sentinel check — model may emit both results and NO_FILES.
+        # The parsing loop naturally returns [] if nothing is found.
+
+        # Parse "file_N: filename, x,y" lines
+        results: list = []
+        for line in reply.split("\n"):
+            # Match: "file_1: report.pdf, 520,185"
+            m = re.search(
+                r"file_\d+:\s*(.+?),\s*(\d+)\s*,\s*(\d+)", line,
+            )
+            if not m:
+                continue
+
+            filename = m.group(1).strip()
+            x = int(m.group(2))
+            y = int(m.group(3))
+
+            # Bounds check
+            if image_size:
+                w, h = image_size
+                if x < 0 or x >= w or y < 0 or y >= h:
+                    log.warning(
+                        "VLM file card coords (%d,%d) out of bounds "
+                        "(%dx%d) for '%s'. Skipping.",
+                        x, y, w, h, filename,
+                    )
+                    continue
+
+            results.append({"filename": filename, "x": x, "y": y})
+
+        log.info("VLM found %d file cards.", len(results))
+        return results
+
+    except Exception as exc:
+        log.error("VLM file card scan API call failed: %s", exc)
         return []
