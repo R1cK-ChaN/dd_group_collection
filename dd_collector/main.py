@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import AppConfig, GroupConfig, load_config
 from .dedup import DedupTracker
-from .dingtalk_ui import DingTalkController, FileInfo
+from .dingtalk_ui import ChatAttachment, DingTalkController, FileInfo
 from .file_mover import get_new_files, move_file_to_gdrive
 from .logger import setup_logging
 from .ui_helpers import send_escape
@@ -105,17 +105,21 @@ def _process_group(
     dedup: DedupTracker,
     group: GroupConfig,
 ) -> None:
-    """Navigate to a group, list files, download new ones, move to GDrive.
+    """Navigate to a group, scan chat for attachments, download, move to GDrive.
+
+    Chat-based two-path processing (replaces the old Files-tab approach):
+    - **File cards** (PDF, XLSX, etc.): click the native Download button.
+    - **Images**: right-click → context menu → Download.
 
     Uses a two-layer filter:
-    1. **Watermark** — timestamp high-water mark; files at or before this are
-       skipped entirely (the list is sorted newest-first, so we ``break``).
-    2. **Filename dedup** — prevents re-downloading a file with the same name
-       even if its timestamp is newer than the watermark (edge case).
+    1. **Watermark** — timestamp high-water mark; attachments at or before
+       this are skipped.
+    2. **Composite dedup** — ``group::timestamp::filename`` prevents
+       re-downloading even if the same filename is re-shared in chat.
 
-    New files are downloaded **oldest-first** so the watermark advances
+    New attachments are downloaded **oldest-first** so the watermark advances
     linearly.  If a download fails mid-batch the watermark is only advanced
-    up to the last success, and the next cycle picks up where it left off.
+    up to the last success.
     """
     log.info("Processing group: %s (alias: %s)", group.name, group.alias)
 
@@ -125,79 +129,79 @@ def _process_group(
         log.warning("Skipping group (navigation failed): %s", group.name)
         return
 
-    if not controller.open_files_tab():
-        log.warning("Skipping group (files tab failed): %s", group.name)
+    # Scan the chat for file cards and images (no Files tab needed)
+    attachments = controller.scan_chat_attachments(
+        max_scrolls=cfg.polling.chat_scroll_pages,
+    )
+    if not attachments:
+        log.info("No attachments found in group chat: %s", group.name)
         return
 
-    # Incremental mode: only load the top of the list (new files are at top)
-    files = controller.list_files(max_scrolls=3)
-    if not files:
-        log.info("No files found in group: %s", group.name)
-        return
-
-    # ── Watermark-based filtering ─────────────────────────────
+    # ── Watermark + dedup filtering ───────────────────────────
     watermark = dedup.get_watermark(group.name)
     log.info(
-        "Group '%s': watermark=%s, visible files=%d",
-        group.name, watermark, len(files),
+        "Group '%s': watermark=%s, scanned attachments=%d",
+        group.name, watermark, len(attachments),
     )
 
-    new_files: list[FileInfo] = []
-    for f in files:
-        # If watermark is set and this file's timestamp is at or before it,
-        # everything below is guaranteed older → stop scanning.
-        if watermark and f.timestamp and f.timestamp <= watermark:
-            break
-        # Skip files already in the dedup tracker (same filename)
-        if dedup.is_downloaded(group.name, f.name):
+    new_attachments: list[ChatAttachment] = []
+    for att in attachments:
+        # Skip if at or before watermark
+        if watermark and att.timestamp and att.timestamp <= watermark:
             continue
-        new_files.append(f)
+        # Skip if already downloaded (composite key)
+        ts = att.timestamp or ""
+        if dedup.is_downloaded_chat(group.name, att.filename, ts):
+            continue
+        new_attachments.append(att)
 
     log.info(
-        "Group '%s': %d new files after watermark+dedup filter.",
-        group.name, len(new_files),
+        "Group '%s': %d new attachments after watermark+dedup filter.",
+        group.name, len(new_attachments),
     )
 
-    if not new_files:
+    if not new_attachments:
         return
 
     # Apply safety cap
     cap = cfg.polling.max_downloads_per_group
-    if len(new_files) > cap:
+    if len(new_attachments) > cap:
         log.warning(
             "Capping downloads for '%s' from %d to %d.",
-            group.name, len(new_files), cap,
+            group.name, len(new_attachments), cap,
         )
-        new_files = new_files[:cap]
+        new_attachments = new_attachments[:cap]
 
-    # Download oldest-new-first so watermark advances linearly
-    new_files.reverse()
+    # Download oldest-first so watermark advances linearly
+    new_attachments.reverse()
 
-    # Take a snapshot of existing files in the download dir before downloading
+    # Snapshot of existing files in the download dir
     dl_dir = cfg.dingtalk.download_dir
     existing_before = _snapshot_download_dir(dl_dir)
 
     downloaded_count = 0
     newest_downloaded_ts: str | None = None
 
-    for file_info in new_files:
+    for att in new_attachments:
         try:
-            success = _download_and_move(
-                cfg, controller, dedup, group, file_info,
+            success = _download_and_move_chat(
+                cfg, controller, dedup, group, att,
                 dl_dir, existing_before,
             )
             if success:
                 downloaded_count += 1
-                # Track the newest timestamp we've successfully downloaded
-                if file_info.timestamp:
-                    if newest_downloaded_ts is None or file_info.timestamp > newest_downloaded_ts:
-                        newest_downloaded_ts = file_info.timestamp
+                if att.timestamp:
+                    if (
+                        newest_downloaded_ts is None
+                        or att.timestamp > newest_downloaded_ts
+                    ):
+                        newest_downloaded_ts = att.timestamp
                 # Update snapshot after each successful download
                 existing_before = _snapshot_download_dir(dl_dir)
         except Exception as exc:
             log.error(
                 "Error downloading '%s' from '%s': %s",
-                file_info.name, group.name, exc, exc_info=True,
+                att.filename, group.name, exc, exc_info=True,
             )
 
     # Advance watermark to the newest successfully-downloaded timestamp
@@ -205,34 +209,35 @@ def _process_group(
         dedup.set_watermark(group.name, newest_downloaded_ts)
 
     log.info(
-        "Group '%s': downloaded %d / %d files.",
-        group.name, downloaded_count, len(new_files),
+        "Group '%s': downloaded %d / %d attachments.",
+        group.name, downloaded_count, len(new_attachments),
     )
 
 
-def _download_and_move(
+def _download_and_move_chat(
     cfg: AppConfig,
     controller: DingTalkController,
     dedup: DedupTracker,
     group: GroupConfig,
-    file_info: FileInfo,
+    att: ChatAttachment,
     dl_dir: str,
     existing_before: set,
 ) -> bool:
-    """Download one file and move it to GDrive.
+    """Download one chat attachment and move it to GDrive.
 
     Returns True if the file was downloaded and moved successfully.
     """
-    log.info("Downloading: %s", file_info.name)
+    log.info("Downloading (%s): %s", att.msg_type, att.filename)
 
-    if not controller.download_file(file_info):
+    if not controller.download_chat_attachment(att):
         return False
 
     # Detect newly appeared files in the download directory
     new_files = get_new_files(dl_dir, existing_before)
     if not new_files:
         log.warning(
-            "Download triggered but no new file appeared for: %s", file_info.name,
+            "Download triggered but no new file appeared for: %s",
+            att.filename,
         )
         return False
 
@@ -246,9 +251,10 @@ def _download_and_move(
         cfg.gdrive.base_path,
     )
 
-    # Mark as downloaded
-    dedup.mark_downloaded(group.name, file_info.name, dest)
-    log.info("Completed: %s → %s", file_info.name, dest)
+    # Mark as downloaded with composite key
+    ts = att.timestamp or ""
+    dedup.mark_downloaded_chat(group.name, att.filename, ts, dest)
+    log.info("Completed: %s → %s", att.filename, dest)
     return True
 
 

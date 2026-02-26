@@ -40,6 +40,8 @@ class GDriveConfig:
 class PollingConfig:
     interval_minutes: int = 30
     max_downloads_per_group: int = 50
+    # Number of scroll-up iterations when scanning a group chat for attachments
+    chat_scroll_pages: int = 3
 
 
 @dataclass
@@ -80,7 +82,7 @@ class UISelectorsConfig:
 class VLMConfig:
     """Vision Language Model settings for UI element detection."""
     api_key: str = ""
-    model: str = "qwen/qwen-vl-plus"
+    model: str = "qwen/qwen3.5-35b-a3b"
     base_url: str = "https://openrouter.ai/api/v1"
     # Pixels around the right-click point to capture for context menu detection
     capture_margin: int = 300
@@ -161,6 +163,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     cfg.polling = PollingConfig(
         interval_minutes=int(p.get("interval_minutes", cfg.polling.interval_minutes)),
         max_downloads_per_group=int(p.get("max_downloads_per_group", cfg.polling.max_downloads_per_group)),
+        chat_scroll_pages=int(p.get("chat_scroll_pages", cfg.polling.chat_scroll_pages)),
     )
 
     # Dedup

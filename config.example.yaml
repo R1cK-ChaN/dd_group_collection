@@ -1,0 +1,78 @@
+# DingTalk Group File Collector — Configuration
+# Copy this file to config.yaml and fill in your values.
+# config.yaml is gitignored — never commit it.
+
+# ── DingTalk settings ──
+dingtalk:
+  window_class: "DtMainFrameView"
+  download_dir: "C:\\Users\\YOUR_USER\\Documents\\DingDing\\download"
+  timeout: 10
+  download_wait: 5
+  download_icon_offset: 8
+
+# ── Groups to collect files from ──
+groups:
+  - name: "YourGroupName"
+    alias: "YourGroupAlias"
+
+# ── Google Drive settings ──
+gdrive:
+  base_path: "G:\\My Drive\\DingTalk Files"
+
+# ── Polling ──
+polling:
+  interval_minutes: 30
+  max_downloads_per_group: 50
+  chat_scroll_pages: 3
+
+# ── Dedup tracker ──
+dedup:
+  path: "data/downloaded.json"
+
+# ── Logging ──
+logging:
+  dir: "logs"
+  level: "INFO"
+  max_bytes: 10485760      # 10 MB
+  backup_count: 5
+
+# ── VLM (Vision Language Model for UI element detection) ──
+vlm:
+  # OpenRouter API key (can also be set via OPENROUTER_API_KEY env var)
+  api_key: ""
+  model: "qwen/qwen3.5-35b-a3b"
+  base_url: "https://openrouter.ai/api/v1"
+  capture_margin: 300
+
+# ── UI Selectors ──
+ui_selectors:
+  search_box:
+    control_type: "EditControl"
+    name: ""
+    class_name: "QLineEdit"
+  search_result_item:
+    control_type: "ListItemControl"
+  files_tab:
+    control_type: "ButtonControl"
+    name: "Files"
+    fallback_control_type: "TabItemControl"
+  file_list:
+    control_type: "ListControl"
+    name: ""
+  file_item:
+    control_type: "ListItemControl"
+  download_button:
+    control_type: "ButtonControl"
+    name: "Download"
+  context_menu_download:
+    control_type: "MenuItemControl"
+    name: "Download"
+  dismiss_buttons:
+    - "Later"
+    - "Cancel"
+    - "OK"
+    - "Ignore this version"
+    - "稍后"
+    - "取消"
+    - "我知道了"
+    - "忽略此版本"

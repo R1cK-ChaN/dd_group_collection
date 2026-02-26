@@ -80,7 +80,7 @@ def find_menu_item_coords(
     target_label: str = "Download",
     region_offset: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
-    model: str = "qwen/qwen-vl-plus",
+    model: str = "qwen/qwen3.5-35b-a3b",
     base_url: str = "https://openrouter.ai/api/v1",
 ) -> Optional[Tuple[int, int]]:
     """Ask a VLM to locate a menu item in a screenshot.
@@ -176,7 +176,7 @@ def find_icon_coords(
     target_description: str = "download icon (a downward arrow ↓)",
     region_offset: Optional[Tuple[int, int]] = None,
     image_size: Optional[Tuple[int, int]] = None,
-    model: str = "qwen/qwen-vl-plus",
+    model: str = "qwen/qwen3.5-35b-a3b",
     base_url: str = "https://openrouter.ai/api/v1",
 ) -> Optional[Tuple[int, int]]:
     """Ask a VLM to locate an icon in a screenshot of a file row.
@@ -276,3 +276,109 @@ def find_icon_coords(
     except Exception as exc:
         log.error("VLM icon API call failed: %s", exc)
         return None
+
+
+def find_image_attachments(
+    api_key: str,
+    screenshot_b64: str,
+    image_size: Optional[Tuple[int, int]] = None,
+    model: str = "qwen/qwen3.5-35b-a3b",
+    base_url: str = "https://openrouter.ai/api/v1",
+) -> list:
+    """Ask a VLM to identify inline image attachments in a chat screenshot.
+
+    Returns a list of (left, top, right, bottom) bounding boxes for each
+    image attachment found.  Coordinates are relative to the screenshot.
+
+    Only returns actual shared image/photo/screenshot attachments — not
+    user avatars, UI icons, stickers, or file cards.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    size_hint = ""
+    if image_size:
+        size_hint = (
+            f"The image is {image_size[0]}x{image_size[1]} pixels. "
+            f"Coordinates must be within 0-{image_size[0] - 1} for x "
+            f"and 0-{image_size[1] - 1} for y. "
+        )
+
+    prompt = (
+        "Look at this screenshot of a DingTalk chat conversation. "
+        f"{size_hint}"
+        "Identify all INLINE IMAGE attachments shared by chat participants. "
+        "These are rectangular photo/screenshot/document image previews "
+        "in the message area.\n"
+        "Do NOT include:\n"
+        "- Small circular user avatars on the left\n"
+        "- UI icons, buttons, stickers, or emoji\n"
+        "- File cards (rectangles with filename, size, and "
+        "Download/Add buttons)\n\n"
+        "For each image attachment, return its bounding box on a new line:\n"
+        "image_1: left,top,right,bottom\n"
+        "image_2: left,top,right,bottom\n\n"
+        "Example:\n"
+        "image_1: 520,100,750,300\n\n"
+        "If no image attachments are found, reply: NO_IMAGES"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{screenshot_b64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=200,
+            temperature=0,
+        )
+
+        reply = resp.choices[0].message.content.strip()
+        log.debug("VLM image scan reply: %s", reply)
+
+        if "NO_IMAGES" in reply.upper():
+            return []
+
+        # Parse bounding boxes from "image_N: left,top,right,bottom" lines
+        boxes: list = []
+        for line in reply.split("\n"):
+            m = re.search(
+                r"(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", line,
+            )
+            if m:
+                left = int(m.group(1))
+                top = int(m.group(2))
+                right = int(m.group(3))
+                bottom = int(m.group(4))
+
+                # Clamp to image bounds
+                if image_size:
+                    w, h = image_size
+                    if left >= w or top >= h or right <= 0 or bottom <= 0:
+                        continue
+                    left = max(0, min(left, w - 1))
+                    top = max(0, min(top, h - 1))
+                    right = max(0, min(right, w))
+                    bottom = max(0, min(bottom, h))
+
+                if right > left and bottom > top:
+                    boxes.append((left, top, right, bottom))
+
+        log.info("VLM found %d image attachments.", len(boxes))
+        return boxes
+
+    except Exception as exc:
+        log.error("VLM image scan API call failed: %s", exc)
+        return []
