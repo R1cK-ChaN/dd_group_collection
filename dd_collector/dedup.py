@@ -85,6 +85,50 @@ class DedupTracker:
             "Watermark updated for '%s': %s", group_name, timestamp_str,
         )
 
+    # ── Chat-based dedup (composite key: group::timestamp::filename) ──
+
+    @staticmethod
+    def _chat_key(
+        group_name: str, file_name: str, msg_timestamp: str,
+    ) -> str:
+        """Build a composite dedup key for chat-based downloads.
+
+        Using ``group::timestamp::filename`` instead of ``group::filename``
+        because the same filename can be re-shared in chat.
+        """
+        return f"{group_name}::{msg_timestamp}::{file_name}"
+
+    def is_downloaded_chat(
+        self, group_name: str, file_name: str, msg_timestamp: str,
+    ) -> bool:
+        """Check if a chat attachment has been downloaded (composite key).
+
+        Also checks the legacy ``group::filename`` key for backward
+        compatibility with files downloaded before the chat-based switch.
+        """
+        key = self._chat_key(group_name, file_name, msg_timestamp)
+        if key in self._data:
+            return True
+        # Backward compat: check legacy key
+        legacy_key = self._key(group_name, file_name)
+        return legacy_key in self._data
+
+    def mark_downloaded_chat(
+        self,
+        group_name: str,
+        file_name: str,
+        msg_timestamp: str,
+        dest_path: str,
+    ) -> None:
+        """Mark a chat attachment as downloaded using the composite key."""
+        key = self._chat_key(group_name, file_name, msg_timestamp)
+        self._data[key] = {
+            "timestamp": time.time(),
+            "msg_timestamp": msg_timestamp,
+            "dest": dest_path,
+        }
+        self._save()
+
     # ── Internal ─────────────────────────────────────────────
 
     @staticmethod

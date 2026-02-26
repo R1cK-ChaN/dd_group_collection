@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pyautogui
 import uiautomation as auto
@@ -34,6 +34,21 @@ class FileInfo:
     name: str
     control: auto.Control  # reference to the ListItem for clicking
     timestamp: Optional[str] = None  # "YYYY/MM/DD HH:MM" from the raw Name
+
+
+@dataclass
+class ChatAttachment:
+    """A downloadable attachment found in a DingTalk chat message.
+
+    Two types:
+    - file_card: PDF/XLSX/etc rendered as a card with a native Download button.
+    - image: Inline image preview; requires right-click → context menu to download.
+    """
+    msg_type: str  # "file_card" or "image"
+    filename: str
+    timestamp: Optional[str] = None  # "YYYY/MM/DD HH:MM"
+    download_button: Optional[auto.Control] = None  # for file_card type
+    image_bounds: Optional[Tuple[int, int, int, int]] = None  # for image type
 
 
 class DingTalkController:
@@ -801,3 +816,481 @@ class DingTalkController:
                     dismissed = True
             if not dismissed:
                 break
+
+    # ── Chat-Based Attachment Scanning & Download ─────────────
+
+    def scan_chat_attachments(
+        self, max_scrolls: int = 3,
+    ) -> List[ChatAttachment]:
+        """Scan the chat for downloadable file cards and images.
+
+        Processes the current visible chat area, then scrolls up to load
+        older messages.  Returns all attachments found across all pages.
+
+        Args:
+            max_scrolls: Number of scroll-up iterations to load history.
+
+        Returns:
+            List of ChatAttachment (may contain both file_card and image types).
+        """
+        if not self._window:
+            return []
+
+        all_attachments: List[ChatAttachment] = []
+        seen_keys: set = set()
+
+        for scroll_i in range(max_scrolls + 1):  # +1 for the initial view
+            # Phase 1: file cards via UIA (fast, no API cost)
+            cards = self._scan_file_cards_uia()
+            for card in cards:
+                key = f"{card.timestamp}::{card.filename}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_attachments.append(card)
+
+            # Phase 2: images via VLM (optional, requires API key)
+            images = self._scan_images_vlm()
+            for img in images:
+                key = f"{img.timestamp}::{img.filename}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_attachments.append(img)
+
+            if scroll_i < max_scrolls:
+                self._scroll_chat_up()
+                time.sleep(1.0)
+
+        log.info(
+            "Chat scan: found %d attachments (%d file cards, %d images) "
+            "across %d pages.",
+            len(all_attachments),
+            sum(1 for a in all_attachments if a.msg_type == "file_card"),
+            sum(1 for a in all_attachments if a.msg_type == "image"),
+            max_scrolls + 1,
+        )
+        return all_attachments
+
+    # ── File Card Scanning (UIA) ──────────────────────────────
+
+    def _scan_file_cards_uia(self) -> List[ChatAttachment]:
+        """Find file cards by locating native Download buttons via UIA.
+
+        File cards in DingTalk chat render with a visible "Download"
+        ButtonControl.  We walk the control tree to find all such buttons
+        and extract the filename/timestamp from nearby controls.
+        """
+        results: List[ChatAttachment] = []
+        buttons = self._find_all_controls_by_name("ButtonControl", "Download")
+        log.debug("UIA scan: found %d Download buttons.", len(buttons))
+
+        for btn in buttons:
+            rect = btn.BoundingRectangle
+            if rect.width() <= 0 or rect.height() <= 0:
+                continue
+
+            filename = self._extract_card_filename(btn)
+            if not filename:
+                log.debug(
+                    "Skipping Download button at (%d,%d) — "
+                    "could not extract filename.",
+                    rect.left, rect.top,
+                )
+                continue
+
+            timestamp = self._extract_nearby_timestamp(btn)
+            results.append(ChatAttachment(
+                msg_type="file_card",
+                filename=filename,
+                timestamp=timestamp,
+                download_button=btn,
+            ))
+
+        return results
+
+    def _find_all_controls_by_name(
+        self,
+        control_type_name: str,
+        name: str,
+        max_depth: int = 15,
+    ) -> list:
+        """Walk the UI tree to find ALL controls matching type and name.
+
+        Unlike find_control() which returns only the first match, this
+        recursively walks children to collect every match.
+
+        Args:
+            control_type_name: e.g. "ButtonControl", "TextControl".
+            name: Required Name property value.
+            max_depth: Maximum tree depth to traverse.
+        """
+        results: list = []
+
+        def _walk(ctrl: auto.Control, depth: int) -> None:
+            if depth > max_depth:
+                return
+            try:
+                if (
+                    ctrl.ControlTypeName == control_type_name
+                    and ctrl.Name == name
+                ):
+                    results.append(ctrl)
+                for child in ctrl.GetChildren():
+                    _walk(child, depth + 1)
+            except Exception:
+                pass
+
+        if self._window:
+            _walk(self._window, 0)
+        return results
+
+    def _extract_card_filename(
+        self, download_btn: auto.Control,
+    ) -> Optional[str]:
+        """Extract the filename from a file card containing a Download button.
+
+        Walks up the parent chain and inspects sibling/child text controls
+        for a filename pattern (string ending with a file extension).
+        """
+        import re
+
+        ctrl = download_btn
+        for _ in range(5):
+            parent = ctrl.GetParentControl()
+            if parent is None:
+                break
+            try:
+                for child in parent.GetChildren():
+                    text = (child.Name or "").strip()
+                    if not text:
+                        continue
+
+                    # Direct match: "report.pdf"
+                    if re.search(r"\.\w{2,5}$", text):
+                        return text
+
+                    # Match with trailing size: "report.pdf  2.9 MB"
+                    m = re.match(r"(.+?\.\w{2,5})\s", text)
+                    if m:
+                        return m.group(1).strip()
+
+                    # Match CJK + extension in longer text:
+                    # "高盛亚洲交易台-260226.PDF"
+                    m = re.search(
+                        r"([\w\-\.\u4e00-\u9fff]+\.\w{2,5})", text,
+                    )
+                    if m:
+                        return m.group(1).strip()
+            except Exception:
+                pass
+            ctrl = parent
+
+        log.debug("Could not extract filename from file card via UIA tree.")
+        return None
+
+    def _extract_nearby_timestamp(
+        self, ctrl: auto.Control,
+    ) -> Optional[str]:
+        """Extract a timestamp from controls near the given control.
+
+        DingTalk chat shows timestamps like "10:37", "Today 11:01",
+        "Yesterday 14:30", or "2025/02/26 10:37" near messages.
+        Walks up the parent chain and checks siblings for time patterns.
+        """
+        import re
+        from datetime import datetime, timedelta
+
+        parent = ctrl
+        for _ in range(5):
+            parent = parent.GetParentControl()
+            if parent is None:
+                break
+
+            try:
+                for child in parent.GetChildren():
+                    text = (child.Name or "").strip()
+                    if not text:
+                        continue
+
+                    # Absolute: "2025/02/26 10:37"
+                    m = re.search(
+                        r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", text,
+                    )
+                    if m:
+                        return m.group(1)
+
+                    # "Today 10:37"
+                    m = re.search(r"Today\s+(\d{2}:\d{2})", text)
+                    if m:
+                        today = datetime.now().strftime("%Y/%m/%d")
+                        return f"{today} {m.group(1)}"
+
+                    # "Yesterday 14:30"
+                    m = re.search(r"Yesterday\s+(\d{2}:\d{2})", text)
+                    if m:
+                        yest = (
+                            datetime.now() - timedelta(days=1)
+                        ).strftime("%Y/%m/%d")
+                        return f"{yest} {m.group(1)}"
+
+                    # Bare time "10:37" (assume today)
+                    m = re.fullmatch(r"(\d{1,2}:\d{2})", text)
+                    if m:
+                        today = datetime.now().strftime("%Y/%m/%d")
+                        return f"{today} {m.group(1)}"
+
+                    # "02-26 10:37" (no year)
+                    m = re.search(
+                        r"(\d{2}-\d{2})\s+(\d{2}:\d{2})", text,
+                    )
+                    if m:
+                        year = datetime.now().strftime("%Y")
+                        date_part = m.group(1).replace("-", "/")
+                        return f"{year}/{date_part} {m.group(2)}"
+            except Exception:
+                pass
+
+        return None
+
+    # ── Image Scanning (VLM) ──────────────────────────────────
+
+    def _scan_images_vlm(self) -> List[ChatAttachment]:
+        """Find image attachments in the chat via VLM screenshot analysis.
+
+        Screenshots the chat area and asks the VLM to identify inline
+        image attachments (not avatars, stickers, or UI icons).
+        """
+        from .vlm import find_image_attachments, grab_screenshot_base64
+
+        vlm_cfg = self.cfg.vlm
+        if not vlm_cfg.api_key:
+            return []
+
+        if not self._window:
+            return []
+
+        try:
+            rect = self._window.BoundingRectangle
+            if rect.width() <= 0 or rect.height() <= 0:
+                return []
+
+            # Capture the chat area (right ~70% of the window, skip sidebar)
+            chat_left = rect.left + int(rect.width() * 0.3)
+            region = (chat_left, rect.top, rect.right, rect.bottom)
+
+            screenshot_b64 = grab_screenshot_base64(region)
+            img_w = rect.right - chat_left
+            img_h = rect.bottom - rect.top
+
+            image_boxes = find_image_attachments(
+                api_key=vlm_cfg.api_key,
+                screenshot_b64=screenshot_b64,
+                image_size=(img_w, img_h),
+                model=vlm_cfg.model,
+                base_url=vlm_cfg.base_url,
+            )
+
+            results: List[ChatAttachment] = []
+            for i, box in enumerate(image_boxes):
+                # Convert from image-relative to screen-absolute coords
+                abs_left = box[0] + chat_left
+                abs_top = box[1] + rect.top
+                abs_right = box[2] + chat_left
+                abs_bottom = box[3] + rect.top
+
+                # Generate a timestamp-based filename for images
+                from datetime import datetime
+                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"image_{ts_str}_{i + 1}.png"
+
+                results.append(ChatAttachment(
+                    msg_type="image",
+                    filename=filename,
+                    timestamp=None,  # VLM can't reliably extract timestamps
+                    image_bounds=(abs_left, abs_top, abs_right, abs_bottom),
+                ))
+
+            return results
+
+        except Exception as exc:
+            log.warning("VLM image scan failed: %s", exc)
+            return []
+
+    # ── Chat Attachment Download ──────────────────────────────
+
+    def download_chat_attachment(self, att: ChatAttachment) -> bool:
+        """Download a chat attachment using the appropriate strategy.
+
+        - file_card: click the native Download button.
+        - image: right-click → context menu → Download.
+
+        Returns True if the download was triggered.
+        """
+        if att.msg_type == "file_card":
+            return self._download_file_card(att)
+        elif att.msg_type == "image":
+            return self._download_image_attachment(att)
+        log.warning("Unknown attachment type: %s", att.msg_type)
+        return False
+
+    def _download_file_card(self, att: ChatAttachment) -> bool:
+        """Download a file card by clicking its native Download button.
+
+        Strategy 1: UIA Click on the ButtonControl.
+        Strategy 2: pyautogui click at button center (if UIA fails).
+        """
+        if not att.download_button:
+            log.warning("No Download button reference for: %s", att.filename)
+            return False
+
+        self._ensure_focus()
+
+        # Strategy 1: UIA click
+        try:
+            att.download_button.Click(simulateMove=False)
+            time.sleep(0.5)
+            self._handle_save_dialog()
+            time.sleep(self.dt.download_wait)
+            log.info(
+                "Download triggered (file card UIA): %s", att.filename,
+            )
+            return True
+        except Exception as exc:
+            log.debug(
+                "UIA click failed for file card '%s': %s",
+                att.filename, exc,
+            )
+
+        # Strategy 2: pyautogui click at button center
+        try:
+            rect = att.download_button.BoundingRectangle
+            if rect.width() > 0 and rect.height() > 0:
+                cx = (rect.left + rect.right) // 2
+                cy = (rect.top + rect.bottom) // 2
+                pyautogui.click(cx, cy)
+                time.sleep(0.5)
+                self._handle_save_dialog()
+                time.sleep(self.dt.download_wait)
+                log.info(
+                    "Download triggered (file card pyautogui): %s",
+                    att.filename,
+                )
+                return True
+        except Exception as exc:
+            log.debug(
+                "pyautogui click failed for file card '%s': %s",
+                att.filename, exc,
+            )
+
+        log.error("Failed to download file card: %s", att.filename)
+        return False
+
+    def _download_image_attachment(self, att: ChatAttachment) -> bool:
+        """Download an image attachment via right-click context menu.
+
+        Strategy 1: right-click → UIA MenuItemControl Name='Download'.
+        Strategy 2: right-click → VLM finds 'Download' in context menu.
+        """
+        if not att.image_bounds:
+            log.warning("No image bounds for: %s", att.filename)
+            return False
+
+        left, top, right, bottom = att.image_bounds
+        cx = (left + right) // 2
+        cy = (top + bottom) // 2
+
+        self._ensure_focus()
+
+        # Right-click the image center
+        pyautogui.rightClick(cx, cy)
+        time.sleep(1.0)
+
+        # Strategy 1: UIA MenuItemControl Name='Download'
+        sel = self.sel.context_menu_download
+        menu_item = find_control(
+            auto.GetRootControl(),
+            sel.control_type,
+            timeout=3,
+            Name=sel.name,
+        )
+        if menu_item:
+            if safe_click(menu_item, delay_after=0.5):
+                self._handle_save_dialog()
+                time.sleep(self.dt.download_wait)
+                log.info(
+                    "Image download triggered (UIA menu): %s", att.filename,
+                )
+                return True
+
+        # Strategy 2: VLM fallback for context menu
+        from .vlm import find_menu_item_coords, grab_screenshot_base64
+
+        vlm_cfg = self.cfg.vlm
+        if vlm_cfg.api_key:
+            try:
+                margin = vlm_cfg.capture_margin
+                cap_left = max(0, cx - margin)
+                cap_top = max(0, cy - margin)
+                cap_right = cx + margin
+                cap_bottom = cy + margin
+                region = (cap_left, cap_top, cap_right, cap_bottom)
+
+                screenshot_b64 = grab_screenshot_base64(region)
+                img_w = cap_right - cap_left
+                img_h = cap_bottom - cap_top
+
+                coords = find_menu_item_coords(
+                    api_key=vlm_cfg.api_key,
+                    screenshot_b64=screenshot_b64,
+                    target_label="Download",
+                    region_offset=(cap_left, cap_top),
+                    image_size=(img_w, img_h),
+                    model=vlm_cfg.model,
+                    base_url=vlm_cfg.base_url,
+                )
+
+                if coords:
+                    pyautogui.click(coords[0], coords[1])
+                    self._handle_save_dialog()
+                    time.sleep(self.dt.download_wait)
+                    log.info(
+                        "Image download triggered (VLM menu): %s",
+                        att.filename,
+                    )
+                    return True
+            except Exception as exc:
+                log.warning("VLM context menu fallback failed: %s", exc)
+
+        # Dismiss lingering context menu
+        pyautogui.press("escape")
+        time.sleep(0.3)
+        log.error("Failed to download image: %s", att.filename)
+        return False
+
+    # ── Chat Helpers ──────────────────────────────────────────
+
+    def _ensure_focus(self) -> None:
+        """Bring DingTalk window to foreground and set keyboard focus."""
+        if self._window:
+            try:
+                self._window.SetActive()
+                self._window.SetFocus()
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+    def _scroll_chat_up(self, clicks: int = 5) -> None:
+        """Scroll the chat area up to load older messages.
+
+        Uses mouse wheel scroll positioned over the chat pane (right 65%
+        of the window to avoid the sidebar).
+        """
+        if not self._window:
+            return
+        try:
+            rect = self._window.BoundingRectangle
+            # Position in the center-right area (chat pane)
+            cx = rect.left + int(rect.width() * 0.65)
+            cy = (rect.top + rect.bottom) // 2
+            pyautogui.scroll(clicks, x=cx, y=cy)
+        except Exception as exc:
+            log.debug("_scroll_chat_up failed: %s", exc)
