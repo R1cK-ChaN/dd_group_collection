@@ -106,6 +106,14 @@ class ClaudeConfig:
 
 
 @dataclass
+class TriggerConfig:
+    """Settings for --trigger watch-and-fire mode."""
+    check_interval_seconds: int = 60   # how often to poll for unread signals
+    red_pixel_threshold: int = 50      # min red sidebar pixels → badge present
+    cooldown_seconds: int = 10         # wait after download before resuming watch
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     groups: List[GroupConfig] = field(default_factory=list)
@@ -116,6 +124,7 @@ class AppConfig:
     ui_selectors: UISelectorsConfig = field(default_factory=UISelectorsConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
+    trigger: TriggerConfig = field(default_factory=TriggerConfig)
 
 
 # ── Loader ───────────────────────────────────────────────────
@@ -216,6 +225,14 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         oauth_token=cl.get("oauth_token", os.environ.get("ANTHROPIC_AUTH_TOKEN", "")),
         model=cl.get("model", cfg.claude.model),
         max_scrolls=int(cl.get("max_scrolls", cfg.claude.max_scrolls)),
+    )
+
+    # Trigger watcher
+    tr = raw.get("trigger", {})
+    cfg.trigger = TriggerConfig(
+        check_interval_seconds=int(tr.get("check_interval_seconds", cfg.trigger.check_interval_seconds)),
+        red_pixel_threshold=int(tr.get("red_pixel_threshold", cfg.trigger.red_pixel_threshold)),
+        cooldown_seconds=int(tr.get("cooldown_seconds", cfg.trigger.cooldown_seconds)),
     )
 
     return cfg

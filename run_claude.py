@@ -15,9 +15,13 @@ Per-group cost:
 
 Usage
 =====
-    python run_claude.py                  # process all groups once
-    python run_claude.py --loop           # poll on configured interval
-    python run_claude.py --group Degg     # one group only
+    python run_claude.py                      # process all groups once (Haiku scanner)
+    python run_claude.py --loop               # poll on configured interval
+    python run_claude.py --group Degg         # one group only
+    python run_claude.py --trigger            # watch for unread, fire on detection
+    python run_claude.py --trigger --group Degg
+    python run_claude.py --autonomous         # full Claude Opus computer-use agent
+    python run_claude.py --autonomous --group Degg
 """
 
 from __future__ import annotations
@@ -34,10 +38,12 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dd_collector.chat_scanner import ChatScanner
+from dd_collector.claude_agent import ClaudeAgent
 from dd_collector.config import load_config
 from dd_collector.dedup import DedupTracker
 from dd_collector.dingtalk_ui import DingTalkController
 from dd_collector.file_mover import get_new_files, move_file_to_gdrive
+from dd_collector.trigger_watcher import TriggerWatcher
 
 
 # ── Logging ───────────────────────────────────────────────────
@@ -268,11 +274,17 @@ def main() -> None:
     # Parse CLI flags
     only_group: Optional[str] = None
     loop_mode = False
+    trigger_mode = False
+    autonomous_mode = False
     args = sys.argv[1:]
     i = 0
     while i < len(args):
         if args[i] == "--loop":
             loop_mode = True
+        elif args[i] == "--trigger":
+            trigger_mode = True
+        elif args[i] == "--autonomous":
+            autonomous_mode = True
         elif args[i] == "--group" and i + 1 < len(args):
             only_group = args[i + 1]
             i += 1
@@ -298,6 +310,105 @@ def main() -> None:
             except KeyboardInterrupt:
                 log.info("Stopped by user.")
                 return
+    elif trigger_mode:
+        watcher = TriggerWatcher(cfg)
+        log.info("Trigger mode: watching for unread messages every %ds. Ctrl+C to stop.",
+                 cfg.trigger.check_interval_seconds)
+        while True:
+            try:
+                reason = watcher.wait_for_trigger()
+            except KeyboardInterrupt:
+                log.info("Stopped by user.")
+                return
+            log.info("Trigger fired (%s) — starting download cycle.", reason)
+            try:
+                run_once(cfg, ctrl, scanner, dedup, only_group=only_group)
+            except KeyboardInterrupt:
+                log.info("Stopped by user.")
+                return
+            except Exception:
+                log.exception("Cycle error after trigger — resuming watch.")
+            log.info("Cooling down %ds before resuming watch…", cfg.trigger.cooldown_seconds)
+            try:
+                time.sleep(cfg.trigger.cooldown_seconds)
+            except KeyboardInterrupt:
+                log.info("Stopped by user.")
+                return
+    elif autonomous_mode:
+        # Prefer OpenRouter key (vlm.api_key) if present — avoids Anthropic credit dependency.
+        # Fall back to claude.oauth_token for direct Anthropic API access.
+        if cfg.vlm.api_key and cfg.vlm.api_key.startswith("sk-or-"):
+            agent_key = cfg.vlm.api_key
+            # Anthropic SDK appends /v1/messages itself, so base_url must NOT end in /v1
+            agent_base_url = cfg.vlm.base_url.rstrip("/")
+            if agent_base_url.endswith("/v1"):
+                agent_base_url = agent_base_url[:-3]   # "https://openrouter.ai/api"
+            agent_model = "anthropic/claude-opus-4-5-20251101"
+            log.info("Autonomous mode: using OpenRouter key → %s", agent_model)
+        else:
+            agent_key = cfg.claude.oauth_token
+            agent_base_url = None
+            agent_model = "claude-opus-4-5-20251101"
+            log.info("Autonomous mode: using Anthropic key → %s", agent_model)
+        agent = ClaudeAgent(
+            oauth_token=agent_key,
+            model=agent_model,
+            log_dir=cfg.logging.dir,
+            base_url=agent_base_url,
+        )
+        for group in cfg.groups:
+            if only_group and group.name != only_group:
+                continue
+            log.info("=" * 60)
+            log.info("Autonomous: Group '%s'  (alias: %s)", group.name, group.alias)
+            log.info("=" * 60)
+
+            # Activate DingTalk window before handing off to Claude
+            try:
+                ctrl._window.SetActive()
+                ctrl._window.SetFocus()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            before = _snapshot_dir(cfg.dingtalk.download_dir)
+            already = dedup.get_downloaded_for_group(group.name)
+            log.info("Already downloaded for '%s': %d file(s)", group.name, len(already))
+
+            try:
+                agent.run_download_task(
+                    group_name=group.name,
+                    download_dir=cfg.dingtalk.download_dir,
+                    already_downloaded=already,
+                    max_scrolls=cfg.claude.max_scrolls,
+                )
+            except KeyboardInterrupt:
+                log.info("Stopped by user.")
+                return
+            except Exception:
+                log.exception("Autonomous agent error for group '%s' — continuing.", group.name)
+
+            log.info("Waiting %ds for downloads to settle…", cfg.dingtalk.download_wait)
+            time.sleep(cfg.dingtalk.download_wait)
+
+            new_files = get_new_files(cfg.dingtalk.download_dir, before)
+            log.info("New files detected: %d", len(new_files))
+            for fpath in new_files:
+                if dedup.is_downloaded(group.name, fpath.name):
+                    log.info("  skip (dedup): %s", fpath.name)
+                    continue
+                try:
+                    dest = move_file_to_gdrive(
+                        file_path=fpath,
+                        group_folder_name=group.alias or group.name,
+                        gdrive_base_path=cfg.gdrive.base_path,
+                    )
+                    dedup.mark_downloaded(group.name, fpath.name, dest)
+                    log.info("  moved: %s → %s", fpath.name, dest)
+                except Exception:
+                    log.exception("  failed to move: %s", fpath.name)
+
+        log.info("Autonomous mode complete.")
     else:
         run_once(cfg, ctrl, scanner, dedup, only_group=only_group)
         log.info("All done.")

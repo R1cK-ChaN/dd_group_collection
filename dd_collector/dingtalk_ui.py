@@ -242,7 +242,22 @@ class DingTalkController:
         if not self._window:
             return False
 
-        self.dismiss_dialogs()
+        # DingTalk's update dialog can reappear immediately after dismissal.
+        # Loop dismiss+check until the search box is actually accessible,
+        # mirroring the wait_for_ready() pattern (up to 45 s).
+        _start = time.time()
+        while True:
+            self.dismiss_dialogs(max_rounds=1)
+            if find_control(
+                self._window,
+                self.sel.search_box.control_type,
+                timeout=2.0,
+                ClassName=self.sel.search_box.class_name,
+            ):
+                break
+            if time.time() - _start > 45:
+                log.error("Search box blocked after 45 s — update dialog persists.")
+                return False
 
         # Ensure DingTalk has real focus before pyautogui events
         try:
