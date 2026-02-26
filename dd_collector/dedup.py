@@ -50,12 +50,23 @@ class DedupTracker:
         self._save()
 
     def get_downloaded_for_group(self, group_name: str) -> List[str]:
-        """Return list of filenames already downloaded for a group."""
+        """Return list of filenames already downloaded for a group.
+
+        Normalises composite keys written by the old main.py path
+        (``group::timestamp::filename``) to plain filenames so the
+        dedup check works regardless of which system created the entry.
+        """
         prefix = f"{group_name}::"
-        return [
-            k[len(prefix):] for k in self._data
-            if k.startswith(prefix) and not k.startswith("__watermark__::")
-        ]
+        results = []
+        for k in self._data:
+            if not k.startswith(prefix) or k.startswith("__watermark__::"):
+                continue
+            suffix = k[len(prefix):]
+            # Composite key "timestamp::filename" → extract just the filename
+            if "::" in suffix:
+                suffix = suffix.rsplit("::", 1)[-1]
+            results.append(suffix)
+        return results
 
     # ── Watermark (incremental high-water mark) ──────────────
 

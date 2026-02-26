@@ -16,6 +16,7 @@ Typical token cost per call:
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import re
@@ -26,6 +27,19 @@ import anthropic
 log = logging.getLogger("dd_collector")
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _get_screen_bounds() -> tuple:
+    """Return (width, height) of the virtual screen (all monitors combined)."""
+    try:
+        user32 = ctypes.windll.user32
+        w = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        h = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return 7680, 4320  # conservative fallback (up to 8K)
 
 # ── Prompt ────────────────────────────────────────────────────
 # Tight, JSON-only instruction.  No explanation requested → fewer output tokens.
@@ -127,13 +141,23 @@ class ChatScanner:
             return []
 
         ox, oy = region_offset
+        screen_w, screen_h = _get_screen_bounds()
         results: List[Dict[str, Any]] = []
         for item in files:
             try:
+                ax = int(item["x"]) + ox
+                ay = int(item["y"]) + oy
+                if not (0 <= ax < screen_w and 0 <= ay < screen_h):
+                    log.warning(
+                        "ChatScanner: discarding out-of-bounds coord (%d, %d) "
+                        "for '%s' (screen %dx%d)",
+                        ax, ay, item.get("filename", "?"), screen_w, screen_h,
+                    )
+                    continue
                 results.append({
                     "filename": str(item.get("filename", "unknown")),
-                    "x": int(item["x"]) + ox,
-                    "y": int(item["y"]) + oy,
+                    "x": ax,
+                    "y": ay,
                 })
             except (KeyError, ValueError, TypeError) as exc:
                 log.debug("ChatScanner: skipping malformed entry %s: %s", item, exc)

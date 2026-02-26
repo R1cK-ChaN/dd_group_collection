@@ -217,6 +217,9 @@ def run_once(
         log.info("Group: %s  (alias: %s)", group.name, group.alias)
         log.info("=" * 60)
 
+        # Dismiss any update/alert dialogs that appeared since last group
+        ctrl.dismiss_dialogs()
+
         moved = _process_group(
             ctrl=ctrl,
             scanner=scanner,
@@ -339,10 +342,12 @@ def main() -> None:
         # Fall back to claude.oauth_token for direct Anthropic API access.
         if cfg.vlm.api_key and cfg.vlm.api_key.startswith("sk-or-"):
             agent_key = cfg.vlm.api_key
-            # Anthropic SDK appends /v1/messages itself, so base_url must NOT end in /v1
+            # Anthropic SDK appends /v1/messages automatically.
+            # Strip any trailing /v1 so the final URL is .../api/v1/messages
+            # and not .../api/v1/v1/messages (double-suffix from OpenRouter URLs).
             agent_base_url = cfg.vlm.base_url.rstrip("/")
             if agent_base_url.endswith("/v1"):
-                agent_base_url = agent_base_url[:-3]   # "https://openrouter.ai/api"
+                agent_base_url = agent_base_url[:-3]  # ".../api/v1" → ".../api"
             agent_model = "anthropic/claude-opus-4-5-20251101"
             log.info("Autonomous mode: using OpenRouter key → %s", agent_model)
         else:
