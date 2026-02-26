@@ -8,7 +8,7 @@ echo ========================================
 :loop
 echo.
 echo [%date% %time%] Starting collector...
-python "%~dp0run.py"
+python "%~dp0run_claude.py"
 echo.
 echo [%date% %time%] Process exited with code %ERRORLEVEL%.
 echo Restarting in 30 seconds... (Ctrl+C to stop)

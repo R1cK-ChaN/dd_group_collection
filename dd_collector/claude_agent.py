@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import anthropic
+import mss
+import mss.tools
 import pyautogui
 
 log = logging.getLogger("dd_collector")
@@ -65,16 +67,17 @@ class ClaudeAgent:
     # ── Screenshot helper ────────────────────────────────────────
 
     def _take_screenshot(self) -> str:
-        """Capture full screen, save PNG to session dir, return base64."""
-        screenshot = pyautogui.screenshot()
-        buf = io.BytesIO()
-        screenshot.save(buf, format="PNG")
-        b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        """Capture full screen via mss (works with CefBrowserWindow), save PNG, return base64."""
+        with mss.mss() as sct:
+            raw = sct.grab(sct.monitors[1])  # monitor[1] = primary display
+            png_bytes = mss.tools.to_png(raw.rgb, raw.size)
+
+        b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
 
         safe_name = self._current_group.replace("/", "_").replace("\\", "_")
         fname = f"{safe_name}_{self._screenshot_idx:04d}.png"
         path = self._session_dir / fname
-        screenshot.save(str(path), "PNG")
+        path.write_bytes(png_bytes)
         log.info("  [screenshot %04d] saved → %s", self._screenshot_idx, path.name)
         self._screenshot_idx += 1
 

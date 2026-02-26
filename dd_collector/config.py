@@ -110,7 +110,7 @@ class TriggerConfig:
     """Settings for --trigger watch-and-fire mode."""
     check_interval_seconds: int = 60   # how often to poll for unread signals
     red_pixel_threshold: int = 50      # min red sidebar pixels → badge present
-    cooldown_seconds: int = 10         # wait after download before resuming watch
+    cooldown_seconds: int = 120        # wait after download before resuming watch
 
 
 @dataclass
