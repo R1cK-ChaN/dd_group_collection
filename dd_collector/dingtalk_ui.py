@@ -6,7 +6,11 @@ UI selectors are loaded from config.yaml so many changes only require a config e
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
+import os
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -66,6 +70,88 @@ class DingTalkController:
 
     # Known DingTalk window classes (tried in order).
     _WINDOW_CLASSES = ("DtMainFrameView", "StandardFrame_DingTalk")
+
+    def ensure_running(self) -> bool:
+        """Launch DingTalk if it is not already running.
+
+        Checks for the main window; if absent, starts the exe from
+        ``dingtalk.exe_path`` in config.yaml and waits up to 30 seconds
+        for the window to appear.
+
+        Returns True if DingTalk is running and a window is visible.
+        Call this before ``connect()`` so the window is guaranteed to exist.
+        """
+        # Fast path: window already exists
+        for cls_name in self._WINDOW_CLASSES:
+            try:
+                win = auto.WindowControl(ClassName=cls_name, searchDepth=1)
+                if win.Exists(maxSearchSeconds=1):
+                    log.info("DingTalk already running (class=%s).", cls_name)
+                    return True
+            except Exception:
+                pass
+
+        # Need to launch — check exe_path is configured
+        exe_path = self.dt.exe_path
+        if not exe_path:
+            log.error(
+                "DingTalk is not running and dingtalk.exe_path is not set "
+                "in config.yaml. Start DingTalk manually or add the exe path."
+            )
+            return False
+
+        if not os.path.isfile(exe_path):
+            log.error("DingTalk exe not found at configured path: %s", exe_path)
+            return False
+
+        log.info("DingTalk not running — launching: %s", exe_path)
+        try:
+            subprocess.Popen([exe_path])
+        except Exception as exc:
+            log.error("Failed to launch DingTalk: %s", exc)
+            return False
+
+        # Wait up to 30 s for the window to appear
+        log.info("Waiting for DingTalk window (up to 30 s)…")
+        for elapsed in range(30):
+            time.sleep(1.0)
+            for cls_name in self._WINDOW_CLASSES:
+                try:
+                    win = auto.WindowControl(ClassName=cls_name, searchDepth=1)
+                    if win.Exists(maxSearchSeconds=1):
+                        log.info(
+                            "DingTalk window appeared after %ds (class=%s).",
+                            elapsed + 1, cls_name,
+                        )
+                        time.sleep(3.0)  # let the app fully initialise
+                        return True
+                except Exception:
+                    pass
+
+        log.error("DingTalk window did not appear after 30 s.")
+        return False
+
+    def wait_for_ready(self, timeout: int = 45) -> bool:
+        """Block until DingTalk's main chat UI is accessible.
+
+        Keeps dismissing startup dialogs (update prompts, announcements) while
+        waiting for the search box to appear.  This is needed when DingTalk
+        was just launched — the window appears quickly but the UI takes several
+        more seconds to fully initialise.
+
+        Returns True once the search box is found; False on timeout.
+        """
+        log.info("Waiting for DingTalk to be ready (up to %ds)…", timeout)
+        for elapsed in range(timeout):
+            # Keep dismissing any dialogs that block the main UI
+            self.dismiss_dialogs(max_rounds=1)
+            box = self._find_search_box()
+            if box:
+                log.info("DingTalk ready (search box found after %ds).", elapsed)
+                return True
+            time.sleep(1.0)
+        log.error("DingTalk not ready after %ds — search box never appeared.", timeout)
+        return False
 
     def connect(self) -> bool:
         """Find and activate the DingTalk main window.
@@ -1223,6 +1309,64 @@ class DingTalkController:
         time.sleep(0.3)
         log.error("Failed to download image: %s", att.filename)
         return False
+
+    # ── Public helpers for optimized scan loop ───────────────
+
+    def get_chat_panel_screenshot(self) -> Tuple[str, int, int]:
+        """Capture the chat panel as a base64 PNG.
+
+        Uses mss (DirectX-based) instead of pyautogui so that DingTalk's
+        hardware-accelerated CefBrowserWindow (chat messages) is captured
+        correctly.  pyautogui uses GDI which renders the CEF area as blank.
+
+        Crops out the left sidebar (~30 % of window width) to reduce the
+        image size sent to Claude by ~30 %.
+
+        Returns:
+            (base64_png, offset_x, offset_y) where offset_x/offset_y is the
+            top-left corner of the crop in screen coordinates.  Add these to
+            any image-relative coordinates returned by ChatScanner to get
+            screen-absolute values for pyautogui.click().
+        """
+        import mss
+        import mss.tools
+
+        if not self._window:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                img = sct.grab(monitor)
+                png = mss.tools.to_png(img.rgb, img.size)
+            return base64.standard_b64encode(png).decode(), 0, 0
+
+        rect = self._window.BoundingRectangle
+        # Skip the left sidebar (chat/contact list, ~30 % of window width)
+        chat_left = rect.left + int(rect.width() * 0.30)
+        chat_top = rect.top
+        width = rect.right - chat_left
+        height = rect.bottom - chat_top
+
+        monitor = {"left": chat_left, "top": chat_top, "width": width, "height": height}
+        with mss.mss() as sct:
+            img = sct.grab(monitor)
+            png = mss.tools.to_png(img.rgb, img.size)
+
+        b64 = base64.standard_b64encode(png).decode()
+        return b64, chat_left, chat_top
+
+    def click_download_at(self, x: int, y: int) -> None:
+        """Click a Download button at screen-absolute coordinates.
+
+        Ensures DingTalk is in focus, performs the click, and handles any
+        save/confirm dialog that may appear afterwards.
+        """
+        self._ensure_focus()
+        pyautogui.click(x, y)
+        time.sleep(0.5)
+        self._handle_save_dialog()
+
+    def scroll_chat_up(self, clicks: int = 5) -> None:
+        """Scroll the chat panel upward to reveal older messages."""
+        self._scroll_chat_up(clicks=clicks)
 
     # ── Chat Helpers ──────────────────────────────────────────
 

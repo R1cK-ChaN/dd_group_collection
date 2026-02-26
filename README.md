@@ -2,88 +2,69 @@
 
 Automated file collection from DingTalk group chats, synced to Google Drive.
 
-Uses RPA-style UI automation (`uiautomation`) to drive the DingTalk PC client — no API keys or admin permissions required.
+Monitors two DingTalk groups for new file attachments (PDFs, spreadsheets, images, etc.), downloads them automatically, and moves them into an organised Google Drive folder structure.
 
-## Deployment Status (2026-02-25)
+---
 
-**Environment:** Windows 11 VM, Python 3.14.3, DingTalk English version, Google Drive for Desktop (G: drive)
+## Architecture — Hybrid Programmatic + Claude Vision
 
-| Step | Status | Notes |
-|------|--------|-------|
-| Clone & install deps | Done | `uiautomation 2.0.29`, `PyYAML 6.0.3` |
-| Config paths | Done | download_dir, gdrive base_path set for user `vm` |
-| Google Drive sync | Verified | Files placed in `G:\My Drive\DingTalk Files\` sync to cloud |
-| Auto-start on boot | Done | `dd_group_collection.bat` in `shell:startup` |
-| Connect to DingTalk | Working | Window class `DtMainFrameView` (was `StandardFrame_DingTalk`) |
-| Navigate to group | Working | Search box `QLineEdit` → `SendKeys` → `Enter` selects first result |
-| Open Files tab | Working | `ButtonControl Name='Files'` (was `'File'`) in group header |
-| List files | **Blocked** | CefBrowserWindow accessibility tree still empty after registry fix |
-| Download files | **Blocked** | Depends on list_files; pyautogui hover approach ready but untested |
-| Move to GDrive | Not yet tested | Depends on download working |
+DingTalk renders its chat content inside a **CefBrowserWindow** (Chromium Embedded Framework) that is completely invisible to Windows UI Automation. The solution splits every task into two categories:
 
-## Known Issues & Challenges
+| Task | Approach | Cost |
+|------|----------|------|
+| Launch DingTalk if not running | `subprocess.Popen` | Free |
+| Find & activate DingTalk window | `uiautomation` | Free |
+| Wait for UI to be ready, dismiss dialogs | `uiautomation` | Free |
+| Navigate to a group | `uiautomation` + `pyautogui` | Free |
+| Scroll chat panel up/down | `pyautogui.scroll` | Free |
+| **Find file cards + Download button coords** | **Claude Haiku vision (1 API call/scroll)** | ~$0.001/call |
+| Click Download button | `pyautogui.click` | Free |
+| Detect & move new files to GDrive | `file_mover.py` | Free |
+| Dedup tracking | `dedup.py` (JSON) | Free |
 
-### 1. CefBrowserWindow accessibility tree not exposed (primary blocker)
+**Token cost per group run:** 3–8 Claude API calls × ~880 tokens = **~$0.003–0.007/group**
+vs. old autonomous agent approach: 30–60 calls × ~8000 tokens = **~$0.45–0.90/group** (~100× cheaper)
 
-The Files tab renders inside a Chromium Embedded Framework web view (`CefBrowserWindow`). The file grid (`DocumentControl` → `GroupControl Name='grid'` → `CustomControl` rows) was visible in an earlier session but is **no longer accessible** — the CefBrowserWindow now returns only an empty `CustomControl` with no children.
-
-**What was tried:**
-- Sending `WM_GETOBJECT` to `Chrome_WidgetWin_1` — returned non-zero but tree stayed empty
-- Starting Windows Narrator to trigger Chromium accessibility — no effect
-- Searching with `searchDepth=15` — no deeper controls found
-- Checking for Chrome DevTools Protocol (CDP) ports — none open
-- **Registry fix (2026-02-25):** Set `HKCU\Software\Chromium\Accessibility\AXMode=1` and `HKCU\Software\Google\Chrome\Accessibility\AXMode=1`, restarted DingTalk — **tree still empty**. DingTalk's CEF build appears to ignore these standard Chromium accessibility flags.
-
-**Current CefBrowserWindow tree (still empty after registry fix):**
 ```
-PaneControl (Class='CefBrowserWindow')
- └─ PaneControl (Class='Chrome_WidgetWin_1')
-     └─ PaneControl
-         └─ CustomControl (empty — no Name, no children)
+run_claude.py
+ │
+ ├─ DingTalkController.ensure_running()    # auto-launch if needed
+ ├─ DingTalkController.connect()           # find + focus window
+ ├─ DingTalkController.wait_for_ready()    # dismiss startup dialogs until search box appears
+ │
+ └─ for each group:
+     ├─ navigate_to_group()               # uiautomation: search → Down+Enter → Esc overlay
+     │
+     └─ for scroll_pass in range(max_scrolls):
+         ├─ get_chat_panel_screenshot()   # mss DirectX capture (captures CefBrowserWindow)
+         ├─ ChatScanner.find_downloads()  # 1× Claude Haiku API call → JSON coordinates
+         ├─ click_download_at(x, y)       # pyautogui click + save-dialog handler
+         └─ scroll_chat_up()             # pyautogui scroll to reveal older messages
+     │
+     ├─ get_new_files()                  # detect settled files in download dir
+     ├─ move_file_to_gdrive()            # organise into {group}/{YYYY-MM}/{filename}
+     └─ dedup.mark_downloaded()         # prevent re-downloads
 ```
 
-**Native controls that ARE visible** (proving the files tab is open):
-- `ButtonControl Name='Upload File'` at (594,626)
-- `ButtonControl Name='Files'` at (986,106)
+---
 
-**Remaining solutions to investigate:**
-1. ~~Set Chromium accessibility via registry~~ — tried, did not work
-2. ~~Launch DingTalk with `--force-renderer-accessibility` flag~~ — DingTalk launcher does not pass flags to CEF
-3. **Use screenshot + OCR to identify file rows visually and click by coordinates** — next approach
-4. Inject CDP access by modifying DingTalk's CEF launch flags
-5. Use keyboard navigation (Tab/Arrow) to select files within the web view
+## Deployment Status (2026-02-26)
 
-### 2. Download mechanism — pyautogui hover approach implemented but blocked by #1
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Python environment | ✅ Working | Python 3.14.3, venv at `.venv/` |
+| DingTalk auto-launch | ✅ Working | Detects if not running, launches exe, waits up to 30s |
+| DingTalk window connect | ✅ Working | Class `StandardFrame_DingTalk` |
+| Startup dialog dismissal | ✅ Working | `wait_for_ready()` loops until search box appears |
+| Navigate to group | ✅ Working | Search overlay handled (Down+Enter → Escape) |
+| Chat panel screenshot | ✅ Fixed | Uses `mss` (DirectX) — `pyautogui` returned blank for CEF content |
+| Claude Haiku API | ✅ Working | Model `claude-haiku-4-5-20251001`, plain messages API (no beta) |
+| Download button detection | 🔧 Testing | End-to-end verification in progress |
+| File move to GDrive | ✅ Implemented | `G:\My Drive\DingTalk Files\{group}\{YYYY-MM}\` |
+| Dedup tracking | ✅ Working | `data/downloaded.json` |
+| Auto-start on boot | ✅ Deployed | `dd_group_collection.bat` in `shell:startup` |
 
-`_download_via_hover_pyautogui()` was added to use `pyautogui` real mouse events:
-1. Gets the file row's `BoundingRectangle` (requires accessibility tree from #1)
-2. Moves the real mouse cursor to the row center (triggers Chromium hover state)
-3. Checks for any newly accessible download button children
-4. If none found, clicks at `(row_right - offset, row_center_y)` where the download icon appears
-
-The offset is configurable via `dingtalk.download_icon_offset` in `config.yaml` (default: 95px). Cannot be tested until the file listing (Issue #1) is resolved.
-
-### 3. Dialog dismissal was closing DingTalk
-
-The `dismiss_buttons` config originally included `"Close"` and `"关闭"`, which matched the **window title bar close button** (`ButtonControl Name='Close'`). This caused the collector to close DingTalk entirely. Fixed by removing these from `config.yaml`.
-
-### 4. Second group navigation can fail
-
-Searching for `资料分享群` returned no results in one test. Root cause identified: leftover text in the search box from the previous search. **Fixed** by clearing the search box with `Ctrl+A` → `Delete` before typing the new group name.
-
-### 5. Python 3.14 — Pillow / pyscreeze not supported
-
-`pyautogui.screenshot()` fails because Pillow has not released a build compatible with Python 3.14. This blocks any screenshot-based approach using pyautogui. Alternatives:
-- Use `mss` (pure-Python screenshot library) instead of Pillow
-- Use Windows native screenshot via `ctypes` / `win32api`
-- Downgrade to Python 3.12/3.13
-
-## Requirements
-
-- Windows (any — physical or VM)
-- Python 3.8+
-- DingTalk PC client — logged in and running
-- Google Drive for Desktop — signed in, with the target folder syncing
+---
 
 ## Quick Start
 
@@ -95,177 +76,132 @@ pip install -r requirements.txt
 
 Edit `config.yaml`:
 
-1. Set `dingtalk.download_dir` to your DingTalk download path
-2. Set `gdrive.base_path` to your Google Drive sync folder
-3. Add your groups under `groups:`
+```yaml
+dingtalk:
+  exe_path: "C:\\Program Files (x86)\\DingDing\\main\\current\\DingTalk.exe"
+  download_dir: "C:\\Users\\YOU\\Documents\\DingDing\\download"
 
-Verify DingTalk UI access:
+groups:
+  - name: "Your Group Name"
+    alias: "FolderName"
+
+gdrive:
+  base_path: "G:\\My Drive\\DingTalk Files"
+
+claude:
+  oauth_token: "sk-ant-api03-..."   # Anthropic API key from console.anthropic.com
+  model: "claude-haiku-4-5-20251001"
+  max_scrolls: 5
+```
+
+Run once (processes all groups then exits):
 
 ```bash
-python tools/inspect_dingtalk.py
+python run_claude.py
 ```
 
-Run the collector:
+Run in polling loop (every 30 minutes by default):
 
 ```bash
-python run.py
+python run_claude.py --loop
 ```
 
-## Auto-start on Windows Boot
+Process one group only:
 
-Copy `start.bat` to `shell:startup` (press `Win+R`, type `shell:startup`). The batch file auto-restarts the collector with a 30-second delay on exit.
-
-Note: the startup copy must `cd /d` to the project directory. The deployed version at `shell:startup\dd_group_collection.bat` already does this.
-
-## Architecture
-
-```
-┌─────────────┐     ┌──────────────────────────────────────────────────────────┐
-│  start.bat  │────>│  run.py                                                  │
-│ (auto-restart)    │    └─> main.py  (polling loop)                           │
-└─────────────┘     │          │                                               │
-                    │          v                                               │
-                    │    ┌─── per cycle ──────────────────────────────────┐    │
-                    │    │  for each group in config.yaml:               │    │
-                    │    │    1. connect()        ─── dingtalk_ui.py ──┐ │    │
-                    │    │    2. navigate_to_group()                   │ │    │
-                    │    │    3. open_files_tab()                      │ │    │
-                    │    │    4. list_files()          ** web view **  │ │    │
-                    │    │    5. filter via dedup  ─── dedup.py        │ │    │
-                    │    │    6. download_file()   ─── dingtalk_ui.py   │ │    │
-                    │    │    7. move to GDrive    ─── file_mover.py   │ │    │
-                    │    │    8. mark downloaded   ─── dedup.py        │ │    │
-                    │    └────────────────────────────────────────────┘ │    │
-                    │          │                                               │
-                    │          v                                               │
-                    │    sleep(interval_minutes)                                │
-                    └──────────────────────────────────────────────────────────┘
+```bash
+python run_claude.py --group "Degg"
 ```
 
-## DingTalk UI Control Tree
+---
 
-Discovered via `tools/inspect_dingtalk.py` and manual inspection (updated 2026-02-25).
+## Requirements
 
-### Current layout (DtMainFrameView)
-
-```
-WindowControl Name='DingTalk' Class='DtMainFrameView'
- ├─ WindowControl Class='DingChatWnd'
- │   ├─ WindowControl Name='ConvTabListView' Class='ConvListView'
- │   │   └─ GroupControl > QStackedWidget > GroupControl
- │   │       └─ (conversation items — Names are EMPTY, not accessible)
- │   ├─ WindowControl Name='ConvTabTopBar' Class='ConvTabTopBarV2'
- │   │   └─ QStackedWidget > GroupControl
- │   └─ WindowControl (right panel — group chat content)
- │       ├─ WindowControl Name='DTIMContentModule'              ← chat messages
- │       ├─ ButtonControl Name='Group Notice'                   ← group header
- │       ├─ ButtonControl Name='Files'                          ← ** FILES TAB **
- │       ├─ ButtonControl Name='Chat History'
- │       ├─ ButtonControl Name='More'
- │       └─ ButtonControl Name='Group Settings'
- ├─ GroupControl Class='QWidget'
- │   ├─ GroupControl Class='client_ding::TitlebarView'
- │   │   └─ EditControl Class='QLineEdit'                      ← ** SEARCH BOX ** (no Name!)
- │   ├─ GroupControl Class='client_ding::NavigatorView'
- │   │   ├─ ButtonControl Name='Standard Edition'
- │   │   ├─ ButtonControl Name='Messages'
- │   │   └─ ButtonControl Name='More'
- │   └─ GroupControl Class='main_frame::DtContentAreaView'
- └─ GroupControl Class='ddesign::TopWindowToolBar'
-     ├─ ButtonControl Name='Minimize'
-     ├─ ButtonControl Name='Maximize'
-     └─ ButtonControl Name='Close'
-```
-
-### Files tab (CefBrowserWindow — accessibility tree EMPTY)
+- Windows (physical or VM)
+- Python 3.8+
+- DingTalk PC client installed (`exe_path` in config handles auto-launch)
+- Google Drive for Desktop — signed in, target folder syncing as a mapped drive
+- Anthropic API key (`sk-ant-api03-...`) from [console.anthropic.com](https://console.anthropic.com)
 
 ```
-PaneControl Class='CefBrowserWindow'  (inside right panel after clicking Files)
- └─ PaneControl Class='Chrome_WidgetWin_1'
-     └─ PaneControl
-         └─ CustomControl  (no Name, no children — NOT ACCESSIBLE)
+pip install -r requirements.txt
+# installs: uiautomation, PyYAML, pyautogui, anthropic, mss, Pillow
 ```
 
-### Legacy layout (StandardFrame_DingTalk) — no longer seen
+---
+
+## Key Technical Notes
+
+### Why `mss` not `pyautogui` for screenshots
+
+DingTalk's chat messages render inside a **CefBrowserWindow** (Chromium). This uses hardware acceleration (DirectX/DXGI), which makes the content invisible to GDI-based tools like `pyautogui.screenshot()` — it returns a blank white panel. `mss` uses DXGI screen capture and correctly captures CEF content.
+
+### Why Claude Haiku not a full computer-use agent
+
+The original implementation used Claude's computer-use API (autonomous agent loop: screenshot → decide → act → repeat). This worked but was expensive (~50 API calls/run) and slow.
+
+The current approach asks Claude ONE targeted question per scroll position:
+> *"Here is a screenshot of the DingTalk chat panel. Return JSON coordinates of every Download button you can see."*
+
+Everything else (navigation, scrolling, clicking, file moving) is plain Python. This reduces Claude usage by ~100× and makes the code deterministic and debuggable.
+
+### Why `claude-haiku-4-5-20251001` not Opus/Sonnet
+
+Coordinate detection from a screenshot is a simple vision task. Haiku is ~20× cheaper than Sonnet and ~80× cheaper than Opus, with sufficient accuracy for finding labelled buttons.
+
+### Search overlay workaround
+
+DingTalk's newer UI opens a full-screen search overlay when the search box is clicked. The overlay covers the chat content but leaves group header buttons (Files, Group Settings) visible — causing naive verification to return false positives. The fix:
+
+1. Type group name → press Down → Enter (selects result, navigates background chat)
+2. Press Escape ×3 to dismiss the overlay
+3. Verify by checking for group-specific header buttons
+
+---
+
+## Module Reference
+
+| File | Purpose |
+|------|---------|
+| `run_claude.py` | **Main entry point** — hybrid programmatic + Claude vision loop |
+| `dd_collector/chat_scanner.py` | Claude Haiku vision: screenshot → Download button coordinates |
+| `dd_collector/dingtalk_ui.py` | All DingTalk UI interaction (UIA + pyautogui) |
+| `dd_collector/file_mover.py` | Detect new downloads, move to GDrive with collision handling |
+| `dd_collector/dedup.py` | JSON-based tracker to prevent re-downloading |
+| `dd_collector/config.py` | Typed dataclasses for config.yaml |
+| `dd_collector/vlm.py` | Legacy Qwen VLM helpers (OpenRouter) — still used by old `run.py` |
+| `run.py` | Legacy entry point (Qwen VLM approach) |
+
+---
+
+## Google Drive File Organisation
 
 ```
-WindowControl (Class='StandardFrame_DingTalk')
- ├─ WindowControl (Class='ChatFileWnd')
- │   └─ PaneControl (Class='CefBrowserWindow')
- │       └─ DocumentControl (Class='Chrome_RenderWidgetHostHWND', Name='群文件-Online')
- │           └─ GroupControl Name='grid'                        ← file list (was accessible)
- └─ EditControl Name='Search'                                  ← search box (had a Name)
-```
-
-### Key behavioral notes
-
-- **Search box** has no Name — must be found by `ClassName='QLineEdit'`.
-- **Conversation list items** all have empty Name attributes — cannot be enumerated.
-- **Navigation** works by typing in the search box via `SendKeys`, then pressing `Enter`
-  (via pyautogui) to select the first search result.
-- After clicking the search box, the foreground window changes to `DtQtWebView`
-  (a search overlay), so pyautogui keyboard events land there correctly.
-- DingTalk must have **both** `SetActive()` and `SetFocus()` before pyautogui
-  mouse/keyboard events will reach it.
-
-## Module Dependency Graph
-
-```
-run.py
- └─> dd_collector/main.py          # orchestration loop
-      ├─> config.py                 # load config.yaml → dataclasses
-      ├─> logger.py                 # rotating file + console logging
-      ├─> dedup.py                  # JSON-based download tracker
-      ├─> file_mover.py            # detect new files, move to GDrive
-      ├─> dingtalk_ui.py           # all DingTalk UI interaction
-      │    └─> ui_helpers.py       # reusable uiautomation wrappers
-      └─> ui_helpers.py            # send_escape() for error recovery
-
-tools/inspect_dingtalk.py           # standalone — no internal deps
-```
-
-## Configuration Reference
-
-All settings live in `config.yaml`. Key sections:
-
-| Section | Purpose |
-|---------|---------|
-| `dingtalk` | Window class, download directory, timeouts, download icon offset |
-| `groups` | List of group names and folder aliases |
-| `gdrive` | Google Drive base path for organized file storage |
-| `polling` | Interval and per-group download cap |
-| `dedup` | Path to the JSON download tracker |
-| `logging` | Log directory, level, rotation settings |
-| `ui_selectors` | DingTalk UI control mappings (update after DingTalk UI changes) |
-
-## File Organization on Google Drive
-
-```
-G:\My Drive\DingTalk Files\         <- gdrive.base_path
- ├── Degg/                          <- group alias
- │    └── 2026-02/
+G:\My Drive\DingTalk Files\       ← gdrive.base_path
+ ├── Degg\
+ │    └── 2026-02\
  │         ├── report.pdf
  │         └── data.xlsx
- └── 资料分享群/
-      └── 2026-02/
-           ├── notes.pdf
-           └── notes_1.pdf          <- auto-increment on collision
+ └── 资料分享群\
+      └── 2026-02\
+           ├── 高盛亚洲交易台-260226.PDF
+           └── 高盛亚洲交易台-260226_1.PDF   ← auto-increment on name collision
 ```
 
-## Troubleshooting UI Selectors
+---
 
-When DingTalk updates its UI, selectors may break. To find new values:
+## Troubleshooting
 
-```bash
-python tools/inspect_dingtalk.py
-python tools/inspect_dingtalk.py --search "File"
-python tools/inspect_dingtalk.py --depth 8
-```
+**DingTalk window not found**
+→ Set `dingtalk.exe_path` in `config.yaml`. The collector auto-launches DingTalk and waits up to 30s for the window.
 
-Use `-X utf8` flag if you see `UnicodeEncodeError` with Chinese characters:
+**Navigation fails / "search box not found"**
+→ DingTalk may still be showing startup dialogs. `wait_for_ready()` handles this automatically; if it times out (45s), start DingTalk manually and re-run.
 
-```bash
-python -X utf8 tools/inspect_dingtalk.py --depth 8 --search "File"
-```
+**0 download buttons found**
+→ Ensure `mss` is installed (`pip install mss`). The screenshot must use DirectX capture; GDI returns a blank panel for CEF content.
 
-Update the `ui_selectors` section in `config.yaml` with the new control types and names.
+**Claude API key rejected**
+→ Use a regular API key (`sk-ant-api03-...`) from [console.anthropic.com](https://console.anthropic.com). Claude Code OAuth tokens (`sk-ant-oat01-...`) are not accepted by the REST API.
+
+**DingTalk UI changes break navigation**
+→ Run `python tools/inspect_dingtalk.py` to explore the current control tree. Update `ui_selectors` in `config.yaml` as needed.

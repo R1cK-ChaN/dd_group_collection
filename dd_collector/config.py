@@ -19,6 +19,9 @@ class DingTalkConfig:
     timeout: int = 10
     download_wait: int = 5
     download_icon_offset: int = 8
+    # Full path to DingTalk.exe — used for auto-launch when not running.
+    # Leave empty to disable auto-launch (requires manual start).
+    exe_path: str = ""
 
 
 @dataclass
@@ -90,10 +93,15 @@ class VLMConfig:
 
 @dataclass
 class ClaudeConfig:
-    """Claude computer-use agent settings."""
+    """Claude vision scanner settings.
+
+    Only the scanner_model is used for routine scans (Haiku — fast and cheap).
+    A more capable model can be set here for debugging or edge cases.
+    """
     oauth_token: str = ""
-    model: str = "claude-opus-4-6"
-    # How many chat screens to scroll when looking for file cards
+    # claude-haiku-4-5-20251001 is ~20x cheaper than Sonnet for this task
+    model: str = "claude-haiku-4-5-20251001"
+    # Number of scroll-up passes per group when scanning for file cards
     max_scrolls: int = 5
 
 
@@ -155,6 +163,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         timeout=int(dt.get("timeout", cfg.dingtalk.timeout)),
         download_wait=int(dt.get("download_wait", cfg.dingtalk.download_wait)),
         download_icon_offset=int(dt.get("download_icon_offset", cfg.dingtalk.download_icon_offset)),
+        exe_path=dt.get("exe_path", cfg.dingtalk.exe_path),
     )
 
     # Groups
