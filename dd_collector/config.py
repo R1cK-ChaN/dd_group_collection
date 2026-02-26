@@ -89,6 +89,15 @@ class VLMConfig:
 
 
 @dataclass
+class ClaudeConfig:
+    """Claude computer-use agent settings."""
+    oauth_token: str = ""
+    model: str = "claude-opus-4-6"
+    # How many chat screens to scroll when looking for file cards
+    max_scrolls: int = 5
+
+
+@dataclass
 class AppConfig:
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     groups: List[GroupConfig] = field(default_factory=list)
@@ -98,6 +107,7 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ui_selectors: UISelectorsConfig = field(default_factory=UISelectorsConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
+    claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
 
 # ── Loader ───────────────────────────────────────────────────
@@ -189,6 +199,14 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         model=v.get("model", cfg.vlm.model),
         base_url=v.get("base_url", cfg.vlm.base_url),
         capture_margin=int(v.get("capture_margin", cfg.vlm.capture_margin)),
+    )
+
+    # Claude computer-use agent
+    cl = raw.get("claude", {})
+    cfg.claude = ClaudeConfig(
+        oauth_token=cl.get("oauth_token", os.environ.get("ANTHROPIC_AUTH_TOKEN", "")),
+        model=cl.get("model", cfg.claude.model),
+        max_scrolls=int(cl.get("max_scrolls", cfg.claude.max_scrolls)),
     )
 
     return cfg

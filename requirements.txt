@@ -1,3 +1,4 @@
 uiautomation>=2.0.20
 PyYAML>=6.0
 pyautogui>=0.9.54
+anthropic>=0.40.0

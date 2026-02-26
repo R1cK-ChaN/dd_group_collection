@@ -137,17 +137,19 @@ class DingTalkController:
     def navigate_to_group(self, group_name: str) -> bool:
         """Search for a group by name and open the conversation.
 
-        DingTalk's conversation list items have empty Name attributes, so
-        we cannot enumerate or identify them via UI Automation.  Instead:
+        DingTalk's newer UI opens a full-window search overlay when the search
+        box is clicked.  The overlay shows search results in web-rendered tabs
+        (Contacts, Groups, Chat Records, etc.) that are invisible to UIA.
 
-        1. Click the search box (QLineEdit) to focus it.
-        2. Type the group name via uiautomation SendKeys — this populates
-           the search field and DingTalk filters/searches in real time.
-        3. Press Enter via pyautogui to select the first result.  Clicking
-           the search box changes the foreground to a DtQtWebView search
-           overlay, so pyautogui keyboard events land there correctly.
-        4. Wait for the group chat to open — verified by checking that the
-           welcome screen is gone or that group header buttons appear.
+        Navigation approach:
+        1. Click the search box (QLineEdit) → search overlay opens.
+        2. Type the group name via SendKeys.
+        3. Press Down → Enter to select the first result in the overlay.
+           This navigates the *background* group to the target even though
+           the search overlay visually remains on top.
+        4. Click the "Collapse (esc)" UIA button to dismiss the overlay,
+           revealing the now-active group chat.
+        5. Verify via group header buttons (Files, Group Settings, etc.).
 
         Returns True if the group was successfully opened.
         """
@@ -164,6 +166,9 @@ class DingTalkController:
         except Exception:
             pass
 
+        # Close any lingering search overlay before starting fresh
+        self._collapse_search_overlay()
+
         # Click search box
         search_box = self._find_search_box()
         if not search_box:
@@ -174,9 +179,6 @@ class DingTalkController:
             return False
 
         # Clear any previous text and type group name.
-        # After clicking the search box the foreground may switch to
-        # DtQtWebView (a search overlay), so we use SendKeys which works
-        # regardless of the foreground window.
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.1)
         pyautogui.press("delete")
@@ -184,33 +186,127 @@ class DingTalkController:
 
         if not set_text(search_box, group_name, delay_after=1.5):
             log.error("Failed to type group name: %s", group_name)
-            send_escape()
+            self._collapse_search_overlay()
             return False
 
-        # Select the first search result by pressing Enter.
-        # The search overlay is focused so pyautogui's Enter goes there.
+        # Press Down then Enter to navigate to the first search result.
+        # Down moves keyboard focus into the result list; Enter selects it.
+        # This navigates the background group chat even though the overlay
+        # visually stays open.
+        pyautogui.press("down")
+        time.sleep(0.4)
         pyautogui.press("enter")
-        time.sleep(2)
+        time.sleep(1.5)
 
-        # Verify that a group chat actually opened.
-        # On success, group header buttons like "Files" appear.
+        # Dismiss the search overlay.  The "Collapse (esc)" button is a UIA
+        # ButtonControl that appears in the top-left of the search overlay.
+        collapsed = self._collapse_search_overlay()
+        if not collapsed:
+            # Fallback: use Escape
+            send_escape()
+        time.sleep(0.5)
+
+        # Verify that the correct group chat is now visible.
         if self._verify_group_opened():
             log.info("Navigated to group: %s", group_name)
             return True
 
-        # If not opened, try pressing Escape and retry with Ctrl-click
-        log.warning("Group chat may not have opened. Retrying...")
-        send_escape()
+        # Retry with a fresh search
+        log.warning(
+            "Group chat may not be open after first attempt; retrying: %s",
+            group_name,
+        )
+        self._collapse_search_overlay()
+        time.sleep(0.3)
+
+        search_box2 = self._find_search_box()
+        if not search_box2:
+            return False
+        if not safe_click(search_box2, delay_after=0.5):
+            return False
+
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.1)
+        pyautogui.press("delete")
+        time.sleep(0.2)
+
+        if not set_text(search_box2, group_name, delay_after=2.0):
+            self._collapse_search_overlay()
+            return False
+
+        pyautogui.press("down")
+        time.sleep(0.4)
+        pyautogui.press("enter")
+        time.sleep(2.0)
+
+        self._collapse_search_overlay()
         time.sleep(0.5)
+
+        if self._verify_group_opened():
+            log.info("Navigated to group (retry): %s", group_name)
+            return True
+
+        log.error("Navigation failed after retry: %s", group_name)
         return False
+
+    def _collapse_search_overlay(self) -> bool:
+        """Close the DingTalk search overlay.
+
+        The search overlay shows a keyboard hint "ESC to Dismiss" at the
+        bottom.  Pressing Escape once clears the query text; pressing Escape
+        a second time (when the query is already empty) dismisses the overlay
+        entirely.  We press Escape up to three times to handle both states.
+
+        Returns True if the overlay was open and a close action was performed.
+        """
+        if not self._window:
+            return False
+
+        # Check if the overlay is open at all
+        collapse_btn = find_control(
+            self._window,
+            "ButtonControl",
+            timeout=0.5,
+            Name="Collapse (esc)",
+        )
+        if not collapse_btn:
+            return False  # Overlay not open, nothing to do
+
+        log.debug(
+            "Search overlay is open; pressing Escape twice to dismiss.",
+        )
+        try:
+            self._window.SetActive()
+            self._window.SetFocus()
+        except Exception:
+            pass
+
+        # First Escape: clears the search query
+        pyautogui.press("escape")
+        time.sleep(0.4)
+        # Second Escape: dismisses the overlay when query is already empty
+        pyautogui.press("escape")
+        time.sleep(0.4)
+        # Third Escape: extra safety for stubborn states
+        pyautogui.press("escape")
+        time.sleep(0.5)
+
+        return True
 
     def _verify_group_opened(self) -> bool:
         """Check whether a group conversation is currently open.
 
-        Looks for characteristic group header buttons (Files, Group Settings, etc.)
-        that only appear inside a group chat.
+        Requires at least one positive signal — group header buttons that only
+        appear inside an open group chat.  The old fallback ("welcome screen is
+        gone") was too permissive: DingTalk's contacts/search pages also have
+        no welcome screen, causing false positives.
         """
-        for btn_name in ("Files", "Group Settings", "Group Notice", "Chat History"):
+        positive_signals = (
+            "Files", "Group Settings", "Group Notice", "Chat History",
+            # Chinese UI variants
+            "文件", "群设置", "群公告", "聊天记录",
+        )
+        for btn_name in positive_signals:
             btn = find_control(
                 self._window, "ButtonControl", timeout=2, Name=btn_name,
             )
@@ -218,12 +314,12 @@ class DingTalkController:
                 log.debug("Group header button found: %s", btn_name)
                 return True
 
-        # Fallback: check that the welcome screen is gone
-        welcome = find_control(
-            self._window, "TextControl", timeout=1,
-            Name="DingTalk, the way of working in the AI era",
+        log.debug(
+            "_verify_group_opened: no group header buttons found "
+            "(tried: %s).",
+            positive_signals,
         )
-        return welcome is None
+        return False
 
     # ── Files Tab ────────────────────────────────────────────
 
@@ -806,10 +902,14 @@ class DingTalkController:
         for _round in range(max_rounds):
             dismissed = False
             for btn_text in self.sel.dismiss_buttons:
+                # Use a short timeout (0.3 s) — we just want a quick check,
+                # not a full 1-second wait per button text.  Reducing this
+                # from 1 s → 0.3 s cuts dismiss_dialogs from ~8 s/round
+                # to ~2.4 s/round.
                 btn = find_control(
                     self._window,
                     "ButtonControl",
-                    timeout=1,
+                    timeout=0.3,
                     Name=btn_text,
                 )
                 if btn:
